@@ -9,7 +9,25 @@ import * as NodePath from "node:path";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeCrypto from "node:crypto";
 
+import * as Schema from "effect/Schema";
+import * as AcpSchema from "effect-acp/schema";
+import type { ProviderApprovalDecision, ProviderApprovalOption } from "@t3tools/contracts";
+
+const decodePermissionRequest = Schema.decodeUnknownSync(AcpSchema.RequestPermissionRequest);
+
 export type DevinEvent =
+  | {
+      type: "permission";
+      requestId: string;
+      request: AcpSchema.RequestPermissionRequest;
+      options: ReadonlyArray<ProviderApprovalOption>;
+    }
+  | {
+      type: "permission-resolved";
+      requestId: string;
+      request: AcpSchema.RequestPermissionRequest;
+      decision: ProviderApprovalDecision;
+    }
   | { type: "text"; text: string }
   | { type: "waiting"; promptId: string; sessionId: string; cancelled: boolean }
   | { type: "cancel-requested" }
@@ -35,6 +53,14 @@ export class DevinOpenTurn {
   private pending = new Map<
     number,
     { resolve: (value: RecordValue) => void; reject: (e: Error) => void }
+  >();
+  private permissions = new Map<
+    string,
+    {
+      id: string | number;
+      request: AcpSchema.RequestPermissionRequest;
+      choices: Map<ProviderApprovalDecision, AcpSchema.PermissionOption>;
+    }
   >();
   private sequence = 0;
   private promptSent = false;
@@ -64,6 +90,7 @@ export class DevinOpenTurn {
 
   private fail(message: string) {
     this.phase = "ended";
+    this.clearPermissions();
     for (const request of this.pending.values()) request.reject(new Error(message));
     this.pending.clear();
     this.options.onEvent({ type: "failed", message });
@@ -284,14 +311,56 @@ export class DevinOpenTurn {
             this.options.onEvent({ type: "text", text: String(content.text ?? "") });
           }
         } else if (message.method && message.id !== undefined) {
-          // MVP never silently grants a permission requested by the native agent.
-          const response =
-            message.method === "session/request_permission"
-              ? { result: { outcome: { outcome: "cancelled" } } }
-              : { error: { code: -32601, message: "Unsupported client request" } };
-          void this.send({ jsonrpc: "2.0", id: message.id, ...response }).catch((error: Error) =>
-            this.fail(error.message),
-          );
+          if (message.method === "session/request_permission") {
+            const request = decodePermissionRequest(message.params);
+            if (typeof message.id !== "string" && typeof message.id !== "number")
+              throw new Error("Invalid permission request ID.");
+            if (
+              request.sessionId !== this.sessionId ||
+              this.cancelRequested ||
+              this.phase === "ended"
+            ) {
+              void this.send({
+                jsonrpc: "2.0",
+                id: message.id,
+                result: { outcome: { outcome: "cancelled" } },
+              }).catch((error: Error) => this.fail(error.message));
+            } else {
+              const requestId = NodeCrypto.randomUUID();
+              const choices = new Map<ProviderApprovalDecision, AcpSchema.PermissionOption>();
+              for (const option of request.options) {
+                const decision =
+                  option.kind === "allow_once"
+                    ? "accept"
+                    : option.kind === "allow_always"
+                      ? "acceptAlways"
+                      : option.kind === "reject_once"
+                        ? "decline"
+                        : undefined;
+                if (decision && option.optionId.trim() && !choices.has(decision))
+                  choices.set(decision, option);
+              }
+              this.permissions.set(requestId, { id: message.id, request, choices });
+              this.options.onEvent({
+                type: "permission",
+                requestId,
+                request,
+                options: [
+                  ...Array.from(choices, ([decision, option]) => ({
+                    decision,
+                    label: option.name.trim() || decision,
+                  })),
+                  { decision: "cancel", label: "Cancel" },
+                ],
+              });
+            }
+          } else {
+            void this.send({
+              jsonrpc: "2.0",
+              id: message.id,
+              error: { code: -32601, message: "Unsupported client request" },
+            }).catch((error: Error) => this.fail(error.message));
+          }
         }
       } catch {
         this.fail("Malformed native ACP message.");
@@ -384,14 +453,63 @@ export class DevinOpenTurn {
     );
     this.waiting = undefined;
   }
+  async respondToPermission(requestId: string, decision: ProviderApprovalDecision) {
+    const pending = this.permissions.get(requestId);
+    if (!pending) throw new Error("This approval request is no longer pending.");
+    const option = pending.choices.get(decision);
+    if (decision !== "cancel" && !option)
+      throw new Error("Devin did not offer this permission choice.");
+    this.permissions.delete(requestId);
+    try {
+      await this.send({
+        jsonrpc: "2.0",
+        id: pending.id,
+        result: {
+          outcome: option
+            ? { outcome: "selected", optionId: option.optionId }
+            : { outcome: "cancelled" },
+        },
+      });
+    } catch (error) {
+      this.options.onEvent({
+        type: "permission-resolved",
+        requestId,
+        request: pending.request,
+        decision: "cancel",
+      });
+      this.fail(error instanceof Error ? error.message : String(error));
+      throw error;
+    }
+    this.options.onEvent({
+      type: "permission-resolved",
+      requestId,
+      request: pending.request,
+      decision,
+    });
+  }
+  private clearPermissions() {
+    for (const [requestId, pending] of this.permissions) {
+      this.options.onEvent({
+        type: "permission-resolved",
+        requestId,
+        request: pending.request,
+        decision: "cancel",
+      });
+    }
+    this.permissions.clear();
+  }
   softCancel() {
     if (!["working", "bootstrapping"].includes(this.phase) || this.cancelRequested) return;
     this.cancelRequested = true;
+    for (const requestId of this.permissions.keys()) {
+      void this.respondToPermission(requestId, "cancel").catch(() => {});
+    }
     if (this.phase === "bootstrapping") this.firstTask = undefined;
     this.options.onEvent({ type: "cancel-requested" });
   }
   close() {
     this.phase = "ended";
+    this.clearPermissions();
     if (this.child?.pid) {
       // This process group was created by this instance; includes its waiting hook.
       try {

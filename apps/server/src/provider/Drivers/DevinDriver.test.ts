@@ -9,11 +9,16 @@ import * as NodeURL from "node:url";
 import { it, expect } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Stream from "effect/Stream";
-import { ProviderInstanceId, ThreadId, type ProviderRuntimeEvent } from "@t3tools/contracts";
+import {
+  ApprovalRequestId,
+  ProviderInstanceId,
+  ThreadId,
+  type ProviderRuntimeEvent,
+} from "@t3tools/contracts";
 import { DevinDriver } from "./DevinDriver.ts";
 
 it.effect(
-  "T3 provider emits separate visible turns and soft-cancel completion from one native prompt",
+  "T3 routes attachments, approvals, and soft cancellation through one native prompt",
   () =>
     Effect.gen(function* () {
       const cwd = yield* Effect.promise(() =>
@@ -80,7 +85,25 @@ it.effect(
             }),
           ).pipe(Effect.forkScoped);
           yield* instance.adapter.startSession({ threadId, cwd, runtimeMode: "approval-required" });
-          const first = yield* instance.adapter.sendTurn({ threadId, input: "FIRST" });
+          // ProviderService supplies attachment paths before dispatching to the driver.
+          const attachmentPath = NodePath.join(cwd, "example.txt");
+          yield* Effect.promise(() => NodeFSP.writeFile(attachmentPath, "attached first task"));
+          const attachment = {
+            type: "file" as const,
+            id: "example",
+            name: "example.txt",
+            mimeType: "text/plain",
+            sizeBytes: 19,
+          };
+          const first = yield* instance.adapter.sendTurn({
+            threadId,
+            input: `READ_ATTACHMENT\n[Attached file "example.txt" is saved at: ${attachmentPath}]`,
+            attachments: [attachment],
+          });
+          const attachmentDelta = yield* Effect.promise(() => take("content.delta"));
+          expect(attachmentDelta.type === "content.delta" && attachmentDelta.payload.delta).toBe(
+            "ATTACHMENT_CONTENT:attached first task",
+          );
           const completed = yield* Effect.promise(() => take("turn.completed"));
           expect(completed.turnId).toBe(first.turnId);
           const clear = yield* instance.adapter
@@ -106,6 +129,72 @@ it.effect(
           yield* instance.adapter.sendTurn({ threadId, input: "/compact" });
           yield* Effect.promise(() => take("thread.state.changed"));
           yield* Effect.promise(() => take("turn.completed"));
+          const png =
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aV1kAAAAASUVORK5CYII=";
+          const imagePath = NodePath.join(cwd, "screenshot.png");
+          yield* Effect.promise(() => NodeFSP.writeFile(imagePath, Buffer.from(png, "base64")));
+          yield* instance.adapter.sendTurn({
+            threadId,
+            // An attachment-only message becomes this reference in ProviderService.
+            input: `[Attached image "screenshot.png" is saved at: ${imagePath}]`,
+            attachments: [
+              {
+                type: "image",
+                id: "screenshot",
+                name: "screenshot.png",
+                mimeType: "image/png",
+                sizeBytes: Buffer.from(png, "base64").length,
+              },
+            ],
+          });
+          while (true) {
+            const event = yield* Effect.promise(() => take("content.delta"));
+            if (
+              event.type === "content.delta" &&
+              event.payload.delta.startsWith("ATTACHMENT_CONTENT:PNG:")
+            ) {
+              expect(event.payload.delta).toBe(`ATTACHMENT_CONTENT:PNG:${png}`);
+              break;
+            }
+          }
+          yield* Effect.promise(() => take("turn.completed"));
+          for (const decision of ["accept", "acceptAlways", "decline", "cancel"] as const) {
+            const turn = yield* instance.adapter.sendTurn({ threadId, input: "ASK_PERMISSION" });
+            const opened = yield* Effect.promise(() => take("request.opened"));
+            expect(opened.turnId).toBe(turn.turnId);
+            expect(opened.providerInstanceId).toBe(instanceId);
+            expect(
+              opened.type === "request.opened" &&
+                opened.payload.options?.map((option) => option.decision),
+            ).toEqual(["accept", "acceptAlways", "decline", "cancel"]);
+            const requestId = ApprovalRequestId.make(opened.requestId!);
+            const invalid = yield* instance.adapter
+              .respondToRequest(threadId, requestId, "acceptForSession")
+              .pipe(Effect.exit);
+            expect(invalid._tag).toBe("Failure");
+            yield* instance.adapter.respondToRequest(threadId, requestId, decision);
+            const resolved = yield* Effect.promise(() => take("request.resolved"));
+            expect(resolved.requestId).toBe(opened.requestId);
+            expect(resolved.type === "request.resolved" && resolved.payload.decision).toBe(
+              decision,
+            );
+            yield* Effect.promise(() => take("turn.completed"));
+            const stale = yield* instance.adapter
+              .respondToRequest(threadId, requestId, decision)
+              .pipe(Effect.exit);
+            expect(stale._tag).toBe("Failure");
+          }
+          yield* instance.adapter.sendTurn({ threadId, input: "ASK_PERMISSION" });
+          yield* Effect.promise(() => take("request.opened"));
+          yield* instance.adapter.interruptTurn(threadId);
+          const interruptedRequest = yield* Effect.promise(() => take("request.resolved"));
+          expect(
+            interruptedRequest.type === "request.resolved" && interruptedRequest.payload.decision,
+          ).toBe("cancel");
+          const interruptedTurn = yield* Effect.promise(() => take("turn.completed"));
+          expect(interruptedTurn.type === "turn.completed" && interruptedTurn.payload.state).toBe(
+            "interrupted",
+          );
           const runRoot = NodePath.join(cwd, "t3-home", "userdata", "providers", "devin", "runs");
           const runs = yield* Effect.promise(() => NodeFSP.readdir(runRoot));
           expect(runs).toHaveLength(1);
@@ -114,6 +203,16 @@ it.effect(
           );
           expect(log.match(/"method":"session\/prompt"/g)).toHaveLength(1);
           expect(log).not.toContain("session/cancel");
+          for (const optionId of ["once-id", "always-id", "deny-id"]) {
+            expect(log).toContain(`"outcome":"selected","optionId":"${optionId}"`);
+          }
+          yield* instance.adapter.sendTurn({ threadId, input: "ASK_PERMISSION" });
+          yield* Effect.promise(() => take("request.opened"));
+          yield* instance.adapter.stopSession(threadId);
+          const closedRequest = yield* Effect.promise(() => take("request.resolved"));
+          expect(closedRequest.type === "request.resolved" && closedRequest.payload.decision).toBe(
+            "cancel",
+          );
         }),
       );
     }),
