@@ -204,3 +204,56 @@ NodeTest.test(
     NodeAssert.equal(result.decision, undefined);
   },
 );
+
+NodeTest.test(
+  "numeric permission IDs and unavailable choices retain the pending request",
+  { timeout: 10000 },
+  async (t) => {
+    const { runtime, take } = await setup(t);
+    await runtime.submit("ASK_PERMISSION NUMERIC");
+    const request = await take("permission");
+    NodeAssert.equal(request.type, "permission");
+    if (request.type !== "permission") return;
+    await NodeAssert.rejects(
+      runtime.respondToPermission(request.requestId, "acceptForSession"),
+      /did not offer/,
+    );
+    await runtime.respondToPermission(request.requestId, "decline");
+    await take("permission-resolved");
+    const result = await take("text");
+    NodeAssert.equal(
+      result.type === "text" && result.text,
+      'PERMISSION_RESULT:{"outcome":{"outcome":"selected","optionId":"deny-id"}}',
+    );
+    await take("waiting");
+    await NodeAssert.rejects(
+      runtime.respondToPermission(request.requestId, "accept"),
+      /no longer pending/,
+    );
+    await runtime.submit("ASK_PERMISSION NO_OPTIONS");
+    const empty = await take("permission");
+    if (empty.type !== "permission") throw new Error("Expected a permission request");
+    NodeAssert.deepEqual(empty.options, [{ decision: "cancel", label: "Cancel" }]);
+    await NodeAssert.rejects(
+      runtime.respondToPermission(empty.requestId, "accept"),
+      /did not offer/,
+    );
+    await runtime.respondToPermission(empty.requestId, "cancel");
+    await take("waiting");
+  },
+);
+
+NodeTest.test(
+  "permission requests for another native session are cancelled",
+  { timeout: 10000 },
+  async (t) => {
+    const { runtime, take } = await setup(t);
+    await runtime.submit("ASK_PERMISSION WRONG_SESSION");
+    const result = await take("text");
+    NodeAssert.equal(
+      result.type === "text" && result.text,
+      'PERMISSION_RESULT:{"outcome":{"outcome":"cancelled"}}',
+    );
+    await take("waiting");
+  },
+);

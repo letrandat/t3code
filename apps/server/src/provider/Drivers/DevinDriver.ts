@@ -7,6 +7,7 @@ import * as NodeCrypto from "node:crypto";
 import {
   DevinSettings,
   EventId,
+  RuntimeRequestId,
   ProviderDriverKind,
   TurnId,
   TextGenerationError,
@@ -26,6 +27,12 @@ import { buildServerProvider } from "../providerSnapshot.ts";
 import { makeManualOnlyProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
 import { withInstanceIdentity } from "./instanceIdentity.ts";
+
+import { parsePermissionRequest } from "../acp/AcpRuntimeModel.ts";
+import {
+  makeAcpRequestOpenedEvent,
+  makeAcpRequestResolvedEvent,
+} from "../acp/AcpCoreRuntimeEvents.ts";
 
 const provider = ProviderDriverKind.make("devin");
 type State = {
@@ -77,7 +84,31 @@ export const DevinDriver: ProviderDriver<typeof DevinSettings.Type, ServerConfig
         ...(state.active ? { turnId: state.active } : {}),
       });
       const onEvent = (state: State, event: DevinEvent) => {
-        if (event.type === "text" && state.active) {
+        if (event.type === "permission" || event.type === "permission-resolved") {
+          const stamp = base(state);
+          const common = {
+            stamp,
+            provider,
+            threadId: state.session.threadId,
+            turnId: state.active,
+            requestId: RuntimeRequestId.make(event.requestId),
+            permissionRequest: parsePermissionRequest(event.request),
+          };
+          emit({
+            ...(event.type === "permission"
+              ? makeAcpRequestOpenedEvent({
+                  ...common,
+                  approvalOptions: event.options,
+                  detail: common.permissionRequest.detail ?? "Devin requests permission.",
+                  args: event.request,
+                  source: "acp.jsonrpc",
+                  method: "session/request_permission",
+                  rawPayload: event.request,
+                })
+              : makeAcpRequestResolvedEvent({ ...common, decision: event.decision })),
+            providerInstanceId: instanceId,
+          });
+        } else if (event.type === "text" && state.active) {
           state.text += event.text;
           emit({
             ...base(state),
@@ -160,8 +191,8 @@ export const DevinDriver: ProviderDriver<typeof DevinSettings.Type, ServerConfig
             const state = requireState(input.threadId);
             if (state.active)
               throw new Error("Wait for the current reply before sending another message.");
-            if (input.attachments?.length)
-              throw new Error("This first version supports text messages only.");
+            // ProviderService adds server-side file paths for every attachment. The
+            // Stop hook carries those references without starting another ACP prompt.
             if (!input.input) throw new Error("A message is required.");
             if (input.input === "/clear")
               throw new Error(
@@ -212,7 +243,12 @@ export const DevinDriver: ProviderDriver<typeof DevinSettings.Type, ServerConfig
             const state = sessions.get(threadId);
             if (state && (!turnId || turnId === state.active)) state.runtime?.softCancel();
           }),
-        respondToRequest: () => unsupported("respondToRequest"),
+        respondToRequest: (threadId, requestId, decision) =>
+          request("respondToRequest", async () => {
+            const runtime = requireState(threadId).runtime;
+            if (!runtime) throw new Error("Devin session has no native run.");
+            await runtime.respondToPermission(requestId, decision);
+          }),
         respondToUserInput: () => unsupported("respondToUserInput"),
         rollbackThread: () => unsupported("rollbackThread"),
         readThread: (threadId) =>
@@ -277,7 +313,7 @@ export const DevinDriver: ProviderDriver<typeof DevinSettings.Type, ServerConfig
                 : "warning",
             auth: { status: "unknown" },
             message: config.allowNativePrompt
-              ? "Text chat preview. Uses one native turn per workspace."
+              ? "Chat preview with file references and permission approvals. Uses one native turn per workspace."
               : "Native prompts disabled until approved.",
           },
         }),
