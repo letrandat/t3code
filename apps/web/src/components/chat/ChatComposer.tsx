@@ -2557,7 +2557,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     [composerDraftTarget, promptRef, scheduleComposerFocus, setComposerDraftPrompt],
   );
 
+  const modelVariantsLocked =
+    selectedProviderStatus?.requiresNewThreadForModelChange === true &&
+    activeThread?.session != null;
   const providerTraitsMenuContent = renderProviderTraitsMenuContent({
+    locked: modelVariantsLocked,
     provider: selectedProvider,
     instanceId: selectedInstanceId,
     ...(routeKind === "server" ? { threadRef: routeThreadRef } : {}),
@@ -2570,6 +2574,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     planModeEnabled: settings.planModeEnabled,
   });
   const providerTraitsPickerInput = {
+    locked: modelVariantsLocked,
     provider: selectedProvider,
     instanceId: selectedInstanceId,
     ...(routeKind === "server" ? { threadRef: routeThreadRef } : {}),

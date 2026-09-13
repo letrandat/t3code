@@ -6,7 +6,26 @@ import * as NodePath from "node:path";
 const config = JSON.parse(
   await NodeFSP.readFile(process.argv[process.argv.indexOf("--config") + 1], "utf8"),
 );
-const model = process.argv[process.argv.indexOf("--model") + 1];
+const model = process.argv.includes("--model")
+  ? process.argv[process.argv.indexOf("--model") + 1]
+  : "fake";
+if (process.argv.includes("models")) {
+  console.log(
+    JSON.stringify({
+      families: [
+        {
+          family_uid: "fake",
+          family_label: "Fake",
+          variants: [{ model_uid: "fake", label: "Fake" }],
+        },
+      ],
+    }),
+  );
+  process.exit(0);
+}
+const testAllowed = process.env.DEVIN_TEST_ALLOWED_FILE
+  ? JSON.parse(await NodeFSP.readFile(process.env.DEVIN_TEST_ALLOWED_FILE, "utf8"))
+  : null;
 const send = (message) =>
   process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\n");
 const update = (text) =>
@@ -120,6 +139,11 @@ async function run(text) {
 }
 NodeReadline.createInterface({ input: process.stdin }).on("line", (line) => {
   const message = JSON.parse(line);
+  if (process.env.DEVIN_TEST_PROTOCOL)
+    NodeFS.appendFileSync(
+      process.env.DEVIN_TEST_PROTOCOL,
+      JSON.stringify({ pid: process.pid, method: message.method }) + "\n",
+    );
   if (!message.method && permissions.has(message.id)) {
     permissions.get(message.id)(message.result);
     permissions.delete(message.id);
@@ -131,7 +155,13 @@ NodeReadline.createInterface({ input: process.stdin }).on("line", (line) => {
       id: message.id,
       result: {
         sessionId: `session-${process.env.DEVIN_CONTROL_RUN_ID}`,
-        configOptions: [{ id: "model", currentValue: model }],
+        configOptions: [
+          {
+            id: "model",
+            currentValue: model,
+            options: (testAllowed ?? [model]).map((value) => ({ value, name: value })),
+          },
+        ],
       },
     });
   if (message.method === "session/prompt") void run(message.params.prompt[0].text);

@@ -145,12 +145,37 @@ export function getProviderOptionDescriptors(input: {
   const { caps, selections } = input;
   const baseDescriptors = (caps.optionDescriptors ?? []).map(cloneDescriptor);
 
-  return baseDescriptors.map((descriptor) =>
-    withDescriptorCurrentValue(
+  let combinations = caps.optionCombinations;
+  return baseDescriptors.map((base) => {
+    const descriptor =
+      base.type === "select" && combinations
+        ? {
+            ...base,
+            options: base.options.filter((option) =>
+              combinations!.some((combination) =>
+                combination.some((value) => value.id === base.id && value.value === option.id),
+              ),
+            ),
+          }
+        : base;
+    const fallbackValue =
+      combinations &&
+      descriptor.type === "select" &&
+      !descriptor.options.some((option) => option.id === descriptor.currentValue)
+        ? (descriptor.options.find((option) => option.isDefault)?.id ?? descriptor.options[0]?.id)
+        : descriptor.currentValue;
+    const resolved = withDescriptorCurrentValue(
       descriptor,
-      getRawSelectionValueById(selections, descriptor.id) ?? descriptor.currentValue,
-    ),
-  );
+      getRawSelectionValueById(selections, descriptor.id) ?? fallbackValue,
+    );
+    if (combinations)
+      combinations = combinations.filter((combination) =>
+        combination.some(
+          (value) => value.id === resolved.id && value.value === resolved.currentValue,
+        ),
+      );
+    return resolved;
+  });
 }
 
 export function getProviderOptionCurrentValue(

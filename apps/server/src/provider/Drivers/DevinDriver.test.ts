@@ -84,6 +84,17 @@ it.effect(
               wake?.();
             }),
           ).pipe(Effect.forkScoped);
+          const snapshot = yield* instance.snapshot.getSnapshot;
+          expect(snapshot.models.map((m) => m.slug)).toEqual(["fake"]);
+          const unknown = yield* instance.adapter
+            .startSession({
+              threadId: ThreadId.make("unknown"),
+              cwd,
+              runtimeMode: "approval-required",
+              modelSelection: { instanceId, model: "unknown" },
+            })
+            .pipe(Effect.exit);
+          expect(unknown._tag).toBe("Failure");
           yield* instance.adapter.startSession({ threadId, cwd, runtimeMode: "approval-required" });
           // ProviderService supplies attachment paths before dispatching to the driver.
           const attachmentPath = NodePath.join(cwd, "example.txt");
@@ -110,6 +121,18 @@ it.effect(
             .sendTurn({ threadId, input: "/clear" })
             .pipe(Effect.exit);
           expect(clear._tag).toBe("Failure");
+          const changedVariant = yield* instance.adapter
+            .sendTurn({
+              threadId,
+              input: "should not send",
+              modelSelection: {
+                instanceId,
+                model: "fake",
+                options: [{ id: "reasoningEffort", value: "high" }],
+              },
+            })
+            .pipe(Effect.exit);
+          expect(changedVariant._tag).toBe("Failure");
           const second = yield* instance.adapter.sendTurn({ threadId, input: "LONG_TOOL" });
           // Consume previous deltas before awaiting the long-tool marker.
           while (true) {

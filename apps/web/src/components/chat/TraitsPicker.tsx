@@ -282,6 +282,7 @@ export interface TraitsMenuContentProps {
   triggerVariant?: VariantProps<typeof buttonVariants>["variant"];
   triggerClassName?: string;
   isComposerOwned?: boolean;
+  locked?: boolean;
 }
 
 export const TraitsMenuContent = memo(function TraitsMenuContentImpl({
@@ -294,6 +295,7 @@ export const TraitsMenuContent = memo(function TraitsMenuContentImpl({
   modelOptions,
   allowPromptInjectedEffort = true,
   planModeEnabled,
+  locked = false,
   ...persistence
 }: TraitsMenuContentProps & TraitsPersistence) {
   const setProviderModelOptions = useComposerDraftStore((store) => store.setProviderModelOptions);
@@ -361,6 +363,13 @@ export const TraitsMenuContent = memo(function TraitsMenuContentImpl({
   if (!hasAnyControls) {
     return null;
   }
+
+  if (locked)
+    return (
+      <p className="px-3 py-2 text-xs text-muted-foreground">
+        Start a new thread to change the model or its variants.
+      </p>
+    );
 
   if (modelIsUnavailable) {
     return (
@@ -502,13 +511,16 @@ export function buildTraitsTriggerDisplay(input: {
       continue;
     }
     if (
-      input.provider === "codex" &&
+      (input.provider === "codex" || input.provider === "devin") &&
       descriptor.id === "serviceTier" &&
       descriptor.type === "select"
     ) {
       const currentValue = getProviderOptionCurrentValue(descriptor);
       const fastTier = descriptor.options.find(({ label }) => label === "Fast");
-      if (fastTier && (currentValue === "default" || currentValue === fastTier.id)) {
+      if (
+        fastTier &&
+        (currentValue === "default" || currentValue === "standard" || currentValue === fastTier.id)
+      ) {
         fastModeEnabled = currentValue === fastTier.id;
         fastModeFallbackLabel =
           descriptor.options.find(({ id }) => id === currentValue)?.label ??
