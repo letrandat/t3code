@@ -49,7 +49,7 @@ const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] = [
     value: ProviderDriverKind.make("devin"),
     label: "Devin",
     icon: OpenCodeIcon,
-    badgeLabel: "Open turn preview",
+    badgeLabel: "Beta",
     settingsSchema: DevinSettings,
   },
   {

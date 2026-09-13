@@ -15,7 +15,12 @@ import {
   type ProviderRuntimeEvent,
   type ThreadId,
 } from "@t3tools/contracts";
-import { createModelCapabilities } from "@t3tools/shared/model";
+import {
+  discoverDevinModels,
+  resolveDevinModel,
+  type DevinModelCatalog,
+} from "../devin/DevinModels.ts";
+import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as Effect from "effect/Effect";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
@@ -40,6 +45,7 @@ type State = {
   runtime?: DevinOpenTurn;
   active?: TurnId | undefined;
   text: string;
+  catalog: DevinModelCatalog;
 };
 
 export const DevinDriver: ProviderDriver<typeof DevinSettings.Type, ServerConfig> = {
@@ -58,6 +64,36 @@ export const DevinDriver: ProviderDriver<typeof DevinSettings.Type, ServerConfig
       const host = { platform: yield* HostProcessPlatform, arch: yield* HostProcessArchitecture };
       const events = yield* Queue.unbounded<ProviderRuntimeEvent>();
       const sessions = new Map<ThreadId, State>();
+      let catalog: DevinModelCatalog | undefined;
+      let discoveryError =
+        "Devin model discovery has not completed. Retry in Settings > Providers.";
+      let discovering: Promise<void> | undefined;
+      const runDiscovery = async (signal?: AbortSignal) => {
+        try {
+          catalog = await discoverDevinModels(
+            config.binaryPath,
+            mergeProviderInstanceEnvironment(environment),
+            config.model,
+            signal,
+          );
+          discoveryError = "";
+        } catch (cause) {
+          catalog = undefined;
+          discoveryError = cause instanceof Error ? cause.message : String(cause);
+        }
+      };
+      const discover = (signal?: AbortSignal) => {
+        if (!discovering)
+          discovering = runDiscovery(signal).finally(() => {
+            discovering = undefined;
+          });
+        return discovering;
+      };
+      if (enabled && config.binaryPath) yield* Effect.promise(discover);
+      const requireCatalog = () => {
+        if (!catalog) throw new Error(discoveryError);
+        return catalog;
+      };
       const emit = (event: ProviderRuntimeEvent) => {
         Queue.offerUnsafe(events, event);
       };
@@ -171,13 +207,14 @@ export const DevinDriver: ProviderDriver<typeof DevinSettings.Type, ServerConfig
             const now = new Date().toISOString();
             const state: State = {
               text: "",
+              catalog: requireCatalog(),
               session: {
                 provider,
                 providerInstanceId: instanceId,
                 threadId: input.threadId,
                 runtimeMode: input.runtimeMode,
                 cwd: input.cwd,
-                model: input.modelSelection?.model ?? config.model,
+                model: resolveDevinModel(requireCatalog(), input.modelSelection),
                 status: "ready",
                 createdAt: now,
                 updatedAt: now,
@@ -198,9 +235,14 @@ export const DevinDriver: ProviderDriver<typeof DevinSettings.Type, ServerConfig
               throw new Error(
                 "Native clear did not remove prior task memory in the live test. Clear is disabled until the patch is verified; the existing native prompt is retained.",
               );
-            if (input.modelSelection && input.modelSelection.model !== state.session.model)
+            if (
+              input.modelSelection &&
+              resolveDevinModel(state.catalog, input.modelSelection) !== state.session.model
+            )
               throw new Error("Model changes require an explicitly new thread.");
             if (!state.runtime) {
+              await Effect.runPromise(refresh);
+              resolveDevinModel(requireCatalog(), { model: state.session.model! });
               state.runtime = new DevinOpenTurn({
                 cwd: state.session.cwd!,
                 runRoot: NodePath.join(serverConfig.stateDir, "providers", "devin", "runs"),
@@ -275,50 +317,52 @@ export const DevinDriver: ProviderDriver<typeof DevinSettings.Type, ServerConfig
         driverKind: provider,
         instanceId,
       });
-      const snapshotValue = withInstanceIdentity({
-        instanceId,
-        driverKind: provider,
-        displayName,
-        accentColor,
-        continuationGroupKey: continuationIdentity.continuationKey,
-      })(
-        buildServerProvider({
-          enabled,
-          checkedAt: new Date().toISOString(),
-          presentation: {
-            displayName: "Devin",
-            badgeLabel: "Open turn preview",
-            showInteractionModeToggle: false,
-            requiresNewThreadForModelChange: true,
-            supportsConversationRollback: false,
-          },
-          models: config.model
-            ? [
-                {
-                  slug: config.model,
-                  name: config.model,
-                  isCustom: false,
-                  isDefault: true,
-                  capabilities: createModelCapabilities({ optionDescriptors: [] }),
-                },
-              ]
-            : [],
-          slashCommands: [{ name: "compact", description: "Compact within the open native turn" }],
-          probe: {
-            installed: NodeFS.existsSync(config.binaryPath),
-            version: null,
-            status:
-              config.allowNativePrompt && config.model && NodeFS.existsSync(config.binaryPath)
-                ? "ready"
-                : "warning",
-            auth: { status: "unknown" },
-            message: config.allowNativePrompt
-              ? "Chat preview with file references and permission approvals. Uses one native turn per workspace."
-              : "Native prompts disabled until approved.",
-          },
-        }),
-      );
-      const snapshot = Effect.succeed(snapshotValue);
+      const makeSnapshot = () =>
+        withInstanceIdentity({
+          instanceId,
+          driverKind: provider,
+          displayName,
+          accentColor,
+          continuationGroupKey: continuationIdentity.continuationKey,
+        })(
+          buildServerProvider({
+            enabled,
+            checkedAt: new Date().toISOString(),
+            presentation: {
+              displayName: "Devin",
+              badgeLabel: "Beta",
+              showInteractionModeToggle: false,
+              requiresNewThreadForModelChange: true,
+              supportsConversationRollback: false,
+            },
+            models: catalog?.models ?? [],
+            slashCommands: [
+              { name: "compact", description: "Compact within the open native turn" },
+            ],
+            probe: {
+              installed: NodeFS.existsSync(config.binaryPath),
+              version: null,
+              status:
+                config.allowNativePrompt && catalog && NodeFS.existsSync(config.binaryPath)
+                  ? "ready"
+                  : "warning",
+              auth: { status: "unknown" },
+              message:
+                discoveryError ||
+                (config.allowNativePrompt
+                  ? "Chat preview with file references and permission approvals. Uses one native turn per workspace."
+                  : "Native prompts disabled until approved."),
+            },
+          }),
+        );
+      const snapshotRef = yield* SubscriptionRef.make(makeSnapshot());
+      const snapshot = SubscriptionRef.get(snapshotRef);
+      const refresh = Effect.gen(function* () {
+        yield* Effect.promise(discover);
+        const next = makeSnapshot();
+        yield* SubscriptionRef.set(snapshotRef, next);
+        return next;
+      });
       const noGeneration = () =>
         Effect.fail(
           new TextGenerationError({
@@ -336,8 +380,8 @@ export const DevinDriver: ProviderDriver<typeof DevinSettings.Type, ServerConfig
         adapter,
         snapshot: {
           getSnapshot: snapshot,
-          refresh: snapshot,
-          streamChanges: Stream.make(snapshotValue),
+          refresh,
+          streamChanges: SubscriptionRef.changes(snapshotRef),
           applyUsageLimits: () => Effect.void,
           resolveMaintenance: () =>
             Effect.succeed(

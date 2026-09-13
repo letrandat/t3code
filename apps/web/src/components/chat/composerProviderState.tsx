@@ -58,6 +58,7 @@ type TraitsRenderInput = {
   triggerVariant?: VariantProps<typeof buttonVariants>["variant"];
   triggerClassName?: string;
   isComposerOwned?: boolean;
+  locked?: boolean;
 };
 
 export function getComposerPromptInjectionState(prompt: string): ComposerPromptInjectionState {
@@ -206,6 +207,7 @@ function renderTraitsControl(
   return (
     <Component
       provider={provider}
+      locked={input.locked}
       {...(instanceId ? { instanceId } : {})}
       models={models}
       {...(threadRef ? { threadRef } : {})}

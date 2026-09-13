@@ -1,4 +1,5 @@
 import { HostProcessPlatform, HostProcessArchitecture } from "@t3tools/shared/hostProcess";
+import { allowedDevinModels } from "./DevinModels.ts";
 import { buildDevinConfig, verifyDevinBinary } from "./DevinLaunchConfig.ts";
 import * as NodeReadline from "node:readline";
 import * as NodeNet from "node:net";
@@ -389,6 +390,10 @@ export class DevinOpenTurn {
         .map(record)
         .find((option) => option.id === "model")?.currentValue ??
       record(session.models).currentModelId;
+    if (!allowedDevinModels(session).ids.has(this.options.model))
+      throw new Error(
+        "Selected Devin model is no longer allowed; no prompt sent. Retry discovery.",
+      );
     if (model !== this.options.model)
       throw new Error(
         `Selected model ${String(model)} differs from ${this.options.model}; no prompt sent.`,
