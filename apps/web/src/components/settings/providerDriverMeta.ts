@@ -4,6 +4,7 @@ import {
   CodexSettings,
   CursorSettings,
   GrokSettings,
+  DevinSettings,
   OpenCodeSettings,
   ProviderDriverKind,
 } from "@t3tools/contracts";
@@ -44,6 +45,13 @@ export interface ProviderClientDefinition {
 }
 
 const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] = [
+  {
+    value: ProviderDriverKind.make("devin"),
+    label: "Devin",
+    icon: OpenCodeIcon,
+    badgeLabel: "Beta",
+    settingsSchema: DevinSettings,
+  },
   {
     value: ProviderDriverKind.make("codex"),
     label: "Codex",

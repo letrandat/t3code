@@ -316,6 +316,29 @@ describe("ProviderSessionReaper", () => {
     expect(harness.stoppedThreadIds.has(threadId)).toBe(true);
   });
 
+  it("retains Devin's open native prompt between visible replies", async () => {
+    const threadId = ThreadId.make("thread-reaper-devin-waiting");
+    const harness = await createHarness({ readModel: makeReadModel([]) });
+    const repository = await runtime!.runPromise(
+      Effect.service(ProviderSessionRuntime.ProviderSessionRuntimeRepository),
+    );
+    await runtime!.runPromise(
+      repository.upsert({
+        threadId,
+        providerName: "devin",
+        providerInstanceId: null,
+        adapterKey: "devin",
+        runtimeMode: "full-access",
+        status: "running",
+        lastSeenAt: "2026-01-01T00:00:00.000Z",
+        resumeCursor: { nativeOpenTurn: true },
+        runtimePayload: null,
+      }),
+    );
+    await sweepAt(Date.parse("2026-04-14T00:00:00.000Z"));
+    expect(harness.stopSession).not.toHaveBeenCalled();
+  });
+
   it("skips stale sessions when the thread still has an active turn", async () => {
     const threadId = ThreadId.make("thread-reaper-active-turn");
     const turnId = TurnId.make("turn-reaper-active");

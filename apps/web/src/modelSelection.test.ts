@@ -340,6 +340,7 @@ describe("instance-scoped model selection", () => {
   });
 
   describe.each([
+    { driverName: "devin", availableModel: "swe-1-6-slow", missingModel: "gpt-6-astra" },
     {
       driverName: "opencode",
       availableModel: "opencode/big-pickle",
