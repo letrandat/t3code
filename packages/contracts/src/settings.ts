@@ -703,6 +703,39 @@ export const CursorSettings = makeProviderSettingsSchema(
 );
 export type CursorSettings = typeof CursorSettings.Type;
 
+export const DevinSettings = makeProviderSettingsSchema({
+  binaryPath: Schema.String.pipe(
+    Schema.withDecodingDefault(Effect.succeed("")),
+    Schema.annotateKey({
+      title: "Patched Devin path",
+      description: "Path to the tested devin-continuous binary.",
+    }),
+  ),
+  model: Schema.String.pipe(
+    Schema.withDecodingDefault(Effect.succeed("")),
+    Schema.annotateKey({
+      title: "Model",
+      description: "Exact model ID from Devin's model list.",
+    }),
+  ),
+  allowNativePrompt: Schema.Boolean.pipe(
+    Schema.withDecodingDefault(Effect.succeed(false)),
+    Schema.annotateKey({
+      title: "Allow a native prompt",
+      description: "Each new workspace starts one native turn. Chat follow-ups reuse that turn.",
+      providerSettingsForm: { control: "switch", clearWhenEmpty: "persist" },
+    }),
+  ),
+  compactionThresholdTokens: Schema.String.pipe(
+    Schema.withDecodingDefault(Effect.succeed("")),
+    Schema.annotateKey({
+      title: "Automatic compact at tokens",
+      description: "Optional earlier trigger, for example 240000. Empty uses Devin's default.",
+    }),
+  ),
+});
+export type DevinSettings = typeof DevinSettings.Type;
+
 export const GrokSettings = makeProviderSettingsSchema(
   {
     // Off by default (like Cursor and OpenCode): the binding is not yet

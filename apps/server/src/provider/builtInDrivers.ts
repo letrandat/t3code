@@ -20,6 +20,7 @@
  *
  * @module provider/builtInDrivers
  */
+import { DevinDriver } from "./Drivers/DevinDriver.ts";
 import { ClaudeDriver, type ClaudeDriverEnv } from "./Drivers/ClaudeDriver.ts";
 import { CodexDriver, type CodexDriverEnv } from "./Drivers/CodexDriver.ts";
 import { CursorDriver, type CursorDriverEnv } from "./Drivers/CursorDriver.ts";
@@ -53,4 +54,5 @@ export const BUILT_IN_DRIVERS: ReadonlyArray<AnyProviderDriver<BuiltInDriversEnv
   GrokDriver,
   OpenCodeDriver,
   AntigravityDriver,
+  DevinDriver,
 ];

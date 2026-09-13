@@ -40,7 +40,9 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
       let reapedCount = 0;
 
       for (const binding of bindings) {
-        if (binding.status === "stopped") {
+        // Devin waits inside its only native prompt between visible replies. Reaping
+        // that wait would end the prompt; it cannot be recovered with another one.
+        if (binding.status === "stopped" || binding.provider === "devin") {
           continue;
         }
 
