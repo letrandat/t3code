@@ -1,3 +1,4 @@
+import { HostProcessPlatform, HostProcessArchitecture } from "@t3tools/shared/hostProcess";
 import * as NodeCrypto from "node:crypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { ServerConfig } from "../../config.ts";
@@ -69,6 +70,8 @@ it.effect(
           }).pipe(
             Effect.provide(ServerConfig.layerTest(cwd, NodePath.join(cwd, "t3-home"))),
             Effect.provide(NodeServices.layer),
+            Effect.provideService(HostProcessPlatform, "darwin"),
+            Effect.provideService(HostProcessArchitecture, "arm64"),
           );
           yield* Stream.runForEach(instance.adapter.streamEvents, (event) =>
             Effect.sync(() => {
