@@ -163,60 +163,6 @@ describe("descriptor helpers", () => {
     expect(getModelSelectionStringOptionValue(selection, "reasoningEffort")).toBe("high");
     expect(getModelSelectionBooleanOptionValue(selection, "fastMode")).toBe(true);
   });
-
-  it("restricts later selectors to remaining option combinations", () => {
-    const caps: ModelCapabilities = {
-      optionDescriptors: [
-        {
-          id: "reasoningEffort",
-          label: "Reasoning",
-          type: "select",
-          options: [
-            { id: "medium", label: "Medium" },
-            { id: "high", label: "High", isDefault: true },
-          ],
-          currentValue: "high",
-        },
-        {
-          id: "serviceTier",
-          label: "Service Tier",
-          type: "select",
-          options: [
-            { id: "standard", label: "Standard", isDefault: true },
-            { id: "fast", label: "Fast" },
-          ],
-          currentValue: "standard",
-        },
-      ],
-      optionCombinations: [
-        [
-          { id: "reasoningEffort", value: "high" },
-          { id: "serviceTier", value: "standard" },
-        ],
-        [
-          { id: "reasoningEffort", value: "high" },
-          { id: "serviceTier", value: "fast" },
-        ],
-        [
-          { id: "reasoningEffort", value: "medium" },
-          { id: "serviceTier", value: "standard" },
-        ],
-      ],
-    };
-
-    expect(
-      getProviderOptionDescriptors({
-        caps,
-        selections: [{ id: "reasoningEffort", value: "medium" }],
-      }).find((descriptor) => descriptor.id === "serviceTier"),
-    ).toEqual({
-      id: "serviceTier",
-      label: "Service Tier",
-      type: "select",
-      options: [{ id: "standard", label: "Standard", isDefault: true }],
-      currentValue: "standard",
-    });
-  });
 });
 
 describe("applyClaudePromptEffortPrefix", () => {

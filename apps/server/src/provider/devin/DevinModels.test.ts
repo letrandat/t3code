@@ -85,6 +85,15 @@ describe("DevinModels", () => {
     expect(allowedDevinModels(session).ids.has("hidden-model")).toBe(false);
   });
 
+  it("does not treat the current model as proof of an allowed model list", () => {
+    expect(() =>
+      allowedDevinModels({ configOptions: [{ id: "model", currentValue: "fake" }] }),
+    ).toThrow(/did not report/);
+    expect(() => buildDevinModelCatalog({ families: [] }, session, "swe-1-6-high")).toThrow(
+      /matched/,
+    );
+  });
+
   it("discovers the fake peer catalog without sending a prompt", async () => {
     const cwd = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-devin-models-"));
     const binaryPath = NodePath.join(cwd, "fake-devin");
@@ -103,13 +112,21 @@ describe("DevinModels", () => {
         output_sha256: NodeCrypto.createHash("sha256").update(binaryBytes).digest("hex"),
       }),
     );
+    const protocol = NodePath.join(cwd, "protocol.jsonl");
     const catalog = await discoverDevinModels(
       binaryPath,
-      { HOME: cwd, PATH: process.env.PATH },
+      { HOME: cwd, PATH: process.env.PATH, DEVIN_TEST_PROTOCOL: protocol },
       "fake",
     );
     expect(catalog.defaultId).toBe("fake");
     expect(catalog.models.map((model) => model.slug)).toEqual(["fake"]);
     expect(resolveDevinModel(catalog, { model: "fake" })).toBe("fake");
+    const messages = (await NodeFSP.readFile(protocol, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    expect(messages.map((message) => message.method)).toEqual(["initialize", "session/new"]);
+    expect(() => process.kill(messages[0].pid, 0)).toThrow();
+    await NodeFSP.rm(cwd, { recursive: true, force: true });
   });
 });

@@ -46,6 +46,16 @@ it.effect(
           }),
         ),
       );
+      const allowedPath = NodePath.join(cwd, "allowed.json");
+      const allowedIds = '["fake","gpt-6-astra-low","gpt-6-astra-high"]';
+      yield* Effect.promise(() => NodeFSP.writeFile(allowedPath, allowedIds));
+      const catalogPath = NodePath.join(cwd, "models.json");
+      yield* Effect.promise(() =>
+        NodeFSP.writeFile(
+          catalogPath,
+          '{"families":[{"family_uid":"fake","variants":[{"model_uid":"fake"}]},{"family_uid":"gpt-6-astra","variants":[{"model_uid":"gpt-6-astra-low"},{"model_uid":"gpt-6-astra-high"}]}]}',
+        ),
+      );
       const instanceId = ProviderInstanceId.make("devin-test");
       const threadId = ThreadId.make("devin-thread");
       const events: ProviderRuntimeEvent[] = [];
@@ -64,7 +74,11 @@ it.effect(
           const instance = yield* DevinDriver.create({
             instanceId,
             displayName: "Devin test",
-            environment: [{ name: "HOME", value: cwd, sensitive: false }],
+            environment: [
+              { name: "HOME", value: cwd, sensitive: false },
+              { name: "DEVIN_TEST_ALLOWED_FILE", value: allowedPath, sensitive: false },
+              { name: "DEVIN_TEST_CATALOG_FILE", value: catalogPath, sensitive: false },
+            ],
             enabled: true,
             config: {
               binaryPath,
@@ -85,7 +99,7 @@ it.effect(
             }),
           ).pipe(Effect.forkScoped);
           const snapshot = yield* instance.snapshot.getSnapshot;
-          expect(snapshot.models.map((m) => m.slug)).toEqual(["fake"]);
+          expect(snapshot.models.map((m) => m.slug)).toEqual(["fake", "gpt-6-astra"]);
           const unknown = yield* instance.adapter
             .startSession({
               threadId: ThreadId.make("unknown"),
@@ -95,7 +109,17 @@ it.effect(
             })
             .pipe(Effect.exit);
           expect(unknown._tag).toBe("Failure");
-          yield* instance.adapter.startSession({ threadId, cwd, runtimeMode: "approval-required" });
+          const selected = yield* instance.adapter.startSession({
+            threadId,
+            cwd,
+            runtimeMode: "approval-required",
+            modelSelection: {
+              instanceId,
+              model: "gpt-6-astra",
+              options: [{ id: "reasoningEffort", value: "high" }],
+            },
+          });
+          expect(selected.model).toBe("gpt-6-astra-high");
           // ProviderService supplies attachment paths before dispatching to the driver.
           const attachmentPath = NodePath.join(cwd, "example.txt");
           yield* Effect.promise(() => NodeFSP.writeFile(attachmentPath, "attached first task"));
@@ -127,12 +151,25 @@ it.effect(
               input: "should not send",
               modelSelection: {
                 instanceId,
-                model: "fake",
-                options: [{ id: "reasoningEffort", value: "high" }],
+                model: "gpt-6-astra",
+                options: [{ id: "reasoningEffort", value: "low" }],
               },
             })
             .pipe(Effect.exit);
           expect(changedVariant._tag).toBe("Failure");
+          yield* Effect.promise(() => NodeFSP.writeFile(allowedPath, "[]"));
+          const failedRefresh = yield* instance.snapshot.refresh;
+          expect(failedRefresh.models).toEqual([]);
+          expect(failedRefresh.status).toBe("warning");
+          const blocked = yield* instance.adapter
+            .startSession({
+              threadId: ThreadId.make("blocked"),
+              cwd,
+              runtimeMode: "approval-required",
+            })
+            .pipe(Effect.exit);
+          expect(blocked._tag).toBe("Failure");
+          // Discovery failure blocks new runs, but never replaces the waiting native prompt.
           const second = yield* instance.adapter.sendTurn({ threadId, input: "LONG_TOOL" });
           // Consume previous deltas before awaiting the long-tool marker.
           while (true) {
@@ -147,6 +184,15 @@ it.effect(
             "interrupted",
           );
           expect(second.turnId).not.toBe(first.turnId);
+          yield* Effect.promise(() => NodeFSP.writeFile(allowedPath, allowedIds));
+          const recovered = yield* instance.snapshot.refresh;
+          expect(recovered.models.map((m) => m.slug)).toEqual(["fake", "gpt-6-astra"]);
+          yield* instance.adapter.startSession({
+            threadId: ThreadId.make("recovered"),
+            cwd,
+            runtimeMode: "approval-required",
+          });
+          yield* instance.adapter.stopSession(ThreadId.make("recovered"));
           yield* instance.adapter.sendTurn({ threadId, input: "AFTER_CANCEL" });
           yield* Effect.promise(() => take("turn.completed"));
           yield* instance.adapter.sendTurn({ threadId, input: "/compact" });
