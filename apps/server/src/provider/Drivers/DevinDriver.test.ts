@@ -1,3 +1,5 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import { ServerConfig } from "../../config.ts";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 import * as NodeOS from "node:os";
@@ -50,7 +52,10 @@ it.effect(
               allowNativePrompt: true,
               compactionThresholdTokens: "240000",
             },
-          });
+          }).pipe(
+            Effect.provide(ServerConfig.layerTest(cwd, NodePath.join(cwd, "t3-home"))),
+            Effect.provide(NodeServices.layer),
+          );
           yield* Stream.runForEach(instance.adapter.streamEvents, (event) =>
             Effect.sync(() => {
               events.push(event);
@@ -59,10 +64,12 @@ it.effect(
           ).pipe(Effect.forkScoped);
           yield* instance.adapter.startSession({ threadId, cwd, runtimeMode: "approval-required" });
           const first = yield* instance.adapter.sendTurn({ threadId, input: "FIRST" });
-        const completed = yield* Effect.promise(() => take("turn.completed"));
-        expect(completed.turnId).toBe(first.turnId);
-        const clear = yield* instance.adapter.sendTurn({ threadId, input: "/clear" }).pipe(Effect.exit);
-        expect(clear._tag).toBe("Failure");
+          const completed = yield* Effect.promise(() => take("turn.completed"));
+          expect(completed.turnId).toBe(first.turnId);
+          const clear = yield* instance.adapter
+            .sendTurn({ threadId, input: "/clear" })
+            .pipe(Effect.exit);
+          expect(clear._tag).toBe("Failure");
           const second = yield* instance.adapter.sendTurn({ threadId, input: "LONG_TOOL" });
           // Consume previous deltas before awaiting the long-tool marker.
           while (true) {
@@ -82,8 +89,11 @@ it.effect(
           yield* instance.adapter.sendTurn({ threadId, input: "/compact" });
           yield* Effect.promise(() => take("thread.state.changed"));
           yield* Effect.promise(() => take("turn.completed"));
+          const runRoot = NodePath.join(cwd, "t3-home", "userdata", "providers", "devin", "runs");
+          const runs = yield* Effect.promise(() => NodeFSP.readdir(runRoot));
+          expect(runs).toHaveLength(1);
           const log = yield* Effect.promise(() =>
-            NodeFSP.readFile(NodePath.join(cwd, ".devin-worker/protocol.jsonl"), "utf8"),
+            NodeFSP.readFile(NodePath.join(runRoot, runs[0]!, "protocol.jsonl"), "utf8"),
           );
           expect(log.match(/"method":"session\/prompt"/g)).toHaveLength(1);
           expect(log).not.toContain("session/cancel");

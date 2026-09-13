@@ -2,7 +2,9 @@ import { connect } from "node:net";
 let input = "";
 for await (const chunk of process.stdin) input += chunk;
 const socket = connect(process.argv[2]);
-socket.on("connect", () => socket.write(input.trim() + "\n"));
+socket.on("connect", () =>
+  socket.write(JSON.stringify({ token: process.argv[3], event: JSON.parse(input) }) + "\n"),
+);
 let response = "";
 let blocked = false;
 const keepBlocked = () => {

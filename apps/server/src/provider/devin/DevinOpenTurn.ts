@@ -36,10 +36,15 @@ export class DevinOpenTurn {
   >();
   private sequence = 0;
   private promptSent = false;
+  readonly runId = NodeCrypto.randomUUID();
+  private hookToken = NodeCrypto.randomBytes(32).toString("hex");
   private state: string;
   private socketPath = NodePath.join(NodeOS.tmpdir(), `t3-devin-${NodeCrypto.randomUUID()}.sock`);
   private options: {
     cwd: string;
+    runRoot: string;
+    threadId: string;
+    providerInstanceId: string;
     binary: string;
     model: string;
     allowNativePrompt: boolean;
@@ -51,7 +56,7 @@ export class DevinOpenTurn {
   };
   constructor(options: DevinOpenTurn["options"]) {
     this.options = options;
-    this.state = NodePath.join(options.cwd, ".devin-worker");
+    this.state = NodePath.join(options.runRoot, this.runId);
   }
 
   private fail(message: string) {
@@ -83,7 +88,21 @@ export class DevinOpenTurn {
     const lines = NodeReadline.createInterface({ input: socket });
     lines.once("line", (line) => {
       try {
-        const data = record(JSON.parse(line));
+        const envelope = record(JSON.parse(line));
+        if (envelope.token !== this.hookToken) {
+          socket.destroy();
+          return;
+        }
+        const data = record(envelope.event);
+        if (this.phase === "ended") return;
+        if (
+          data.session_id !== this.sessionId ||
+          !data.prompt_id ||
+          (this.promptId && data.prompt_id !== this.promptId)
+        ) {
+          this.fail("Native hook identity does not match this run. No continuation sent.");
+          return;
+        }
         void NodeFSP.appendFile(NodePath.join(this.state, "hooks.jsonl"), line + "\n").catch(() =>
           this.fail("Hook evidence could not be saved."),
         );
@@ -119,7 +138,7 @@ export class DevinOpenTurn {
           socket.end("{}\n");
           return;
         }
-        if (this.phase === "ended" || this.waiting) {
+        if (this.waiting) {
           this.fail("Unexpected Stop hook; no continuation sent.");
           return;
         }
@@ -156,7 +175,10 @@ export class DevinOpenTurn {
     )
       throw new Error("Compaction threshold must be a positive whole number.");
     if (this.phase !== "new") throw new Error("This native run cannot be restarted.");
-    // Exclusive directory ownership also prevents attaching to an existing Devin worker.
+    // Never share control state or infer run identity from the project directory.
+    if (!NodePath.isAbsolute(this.options.runRoot))
+      throw new Error("Devin run root must be absolute.");
+    await NodeFSP.mkdir(this.options.runRoot, { recursive: true, mode: 0o700 });
     await NodeFSP.mkdir(this.state, { mode: 0o700 });
     this.server = NodeNet.createServer((socket) => this.onHook(socket));
     await new Promise<void>((resolve, reject) => {
@@ -169,6 +191,7 @@ export class DevinOpenTurn {
       process.execPath,
       NodeURL.fileURLToPath(new URL("./hook.mjs", import.meta.url)),
       this.socketPath,
+      this.hookToken,
     ]
       .map(quote)
       .join(" ");
@@ -190,13 +213,34 @@ export class DevinOpenTurn {
       }),
       { mode: 0o600 },
     );
+    const launchEnvironment = { ...(this.options.environment ?? process.env) };
+    for (const key of Object.keys(launchEnvironment)) {
+      if (key.startsWith("DEVIN_CONTROL_")) delete launchEnvironment[key];
+    }
+    Object.assign(launchEnvironment, {
+      DEVIN_CONTROL_DIR: this.state,
+      DEVIN_CONTROL_RUN_ID: this.runId,
+      DEVIN_CONTROL_ABI: "1",
+    });
+    // exec preserves the shell PID; inherited child settings retain that owner's PID.
     this.child = NodeChildProcess.spawn(
-      this.options.binary,
-      [...(this.options.args ?? []), "--config", configPath, "acp", "--model", this.options.model],
+      "/bin/sh",
+      [
+        "-c",
+        'export DEVIN_CONTROL_OWNER_PID=$$; exec "$@"',
+        "t3-devin",
+        this.options.binary,
+        ...(this.options.args ?? []),
+        "--config",
+        configPath,
+        "acp",
+        "--model",
+        this.options.model,
+      ],
       {
         cwd: this.options.cwd,
         detached: true,
-        env: this.options.environment ?? process.env,
+        env: launchEnvironment,
         stdio: "pipe",
       },
     );
@@ -241,6 +285,18 @@ export class DevinOpenTurn {
         this.fail("Malformed native ACP message.");
       }
     });
+    await NodeFSP.writeFile(
+      NodePath.join(this.state, "identity.json"),
+      JSON.stringify({
+        runId: this.runId,
+        threadId: this.options.threadId,
+        providerInstanceId: this.options.providerInstanceId,
+        cwd: this.options.cwd,
+        pid: this.child.pid,
+        status: "starting",
+      }),
+      { mode: 0o600 },
+    );
     await this.rpc("initialize", {
       protocolVersion: 1,
       clientCapabilities: {},
@@ -258,6 +314,19 @@ export class DevinOpenTurn {
       );
     if (typeof session.sessionId !== "string") throw new Error("ACP did not return a session ID.");
     this.sessionId = session.sessionId;
+    await NodeFSP.writeFile(
+      NodePath.join(this.state, "identity.json"),
+      JSON.stringify({
+        runId: this.runId,
+        threadId: this.options.threadId,
+        providerInstanceId: this.options.providerInstanceId,
+        cwd: this.options.cwd,
+        pid: this.child.pid,
+        sessionId: this.sessionId,
+        status: "connected",
+      }),
+      { mode: 0o600 },
+    );
   }
   async submit(text: string) {
     if (!text.trim()) throw new Error("Message is empty.");
@@ -287,11 +356,10 @@ export class DevinOpenTurn {
       this.waiting = undefined;
     }
   }
-  async context(mode: "compact" | "fresh") {
+  async context(mode: "compact") {
     if (this.phase !== "waiting" || !this.waiting)
       throw new Error("Context actions require the waiting Stop hook.");
     this.cancelRequested = false;
-    if (mode === "fresh") await NodeFSP.writeFile(NodePath.join(this.state, "fresh.request"), "");
     await NodeFSP.writeFile(NodePath.join(this.state, "compact.request"), "");
     this.maintenance = mode;
     this.phase = "context";
