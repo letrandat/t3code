@@ -2,7 +2,7 @@ import { createInterface } from "node:readline";
 import { readFile, writeFile, unlink } from "node:fs/promises";
 import { watch, existsSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 const config = JSON.parse(
   await readFile(process.argv[process.argv.indexOf("--config") + 1], "utf8"),
 );
@@ -13,7 +13,7 @@ const update = (text) =>
   send({
     method: "session/update",
     params: {
-      sessionId: "fake-session",
+      sessionId: `session-${process.env.DEVIN_CONTROL_RUN_ID}`,
       update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
     },
   });
@@ -29,15 +29,15 @@ const hook = (name, extra = {}) =>
     child.stdin.end(
       JSON.stringify({
         hook_event_name: name,
-        session_id: "fake-session",
-        prompt_id: "fake-prompt",
+        session_id: `session-${process.env.DEVIN_CONTROL_RUN_ID}`,
+        prompt_id: `prompt-${process.env.DEVIN_CONTROL_RUN_ID}`,
         ...extra,
       }),
     );
   });
 const waitFile = (path) =>
   new Promise((resolve) => {
-    const watcher = watch(process.cwd(), () => {
+    const watcher = watch(dirname(path), () => {
       if (existsSync(path)) {
         watcher.close();
         resolve();
@@ -53,17 +53,18 @@ async function run(text) {
   while (true) {
     if (text.includes("LONG_TOOL")) {
       update("TOOL_RUNNING");
-      await waitFile(join(process.cwd(), "release-tool"));
+      const target = text.includes("ISOLATED") ? process.env.DEVIN_CONTROL_DIR : process.cwd();
+      await waitFile(join(target, "release-tool"));
       const result = await hook("PreToolUse", { tool_name: "exec" });
-      await writeFile("tool-result.json", JSON.stringify(result));
+      await writeFile(join(target, "tool-result.json"), JSON.stringify(result));
       update(result.decision === "block" ? "PARTIAL_RESULT" : "TOOL_EXECUTED");
     } else update(`Reply ${++count}: ${text}`);
     let response = await hook("Stop");
     if (response.decision !== "block") process.exit(2);
-    while (existsSync(".devin-worker/compact.request")) {
-      await unlink(".devin-worker/compact.request");
-      const fresh = existsSync(".devin-worker/fresh.request");
-      if (fresh) await unlink(".devin-worker/fresh.request");
+    while (existsSync(`${process.env.DEVIN_CONTROL_DIR}/compact.request`)) {
+      await unlink(`${process.env.DEVIN_CONTROL_DIR}/compact.request`);
+      const fresh = existsSync(`${process.env.DEVIN_CONTROL_DIR}/fresh.request`);
+      if (fresh) await unlink(`${process.env.DEVIN_CONTROL_DIR}/fresh.request`);
       await hook("PostCompaction", {
         summary: fresh
           ? "Fresh task context. Keep the worker instructions."
@@ -77,10 +78,14 @@ async function run(text) {
 createInterface({ input: process.stdin }).on("line", (line) => {
   const message = JSON.parse(line);
   if (message.method === "initialize") send({ id: message.id, result: { protocolVersion: 1 } });
+  if (message.method === "session/new") update("EARLY_CONFIG_UPDATE");
   if (message.method === "session/new")
     send({
       id: message.id,
-      result: { sessionId: "fake-session", configOptions: [{ id: "model", currentValue: model }] },
+      result: {
+        sessionId: `session-${process.env.DEVIN_CONTROL_RUN_ID}`,
+        configOptions: [{ id: "model", currentValue: model }],
+      },
     });
   if (message.method === "session/prompt") void run(message.params.prompt[0].text);
 });

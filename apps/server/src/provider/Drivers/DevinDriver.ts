@@ -1,3 +1,6 @@
+import { HostProcessPlatform, HostProcessArchitecture } from "@t3tools/shared/hostProcess";
+import * as NodePath from "node:path";
+import { ServerConfig } from "../../config.ts";
 import * as NodeFS from "node:fs";
 import * as NodeCrypto from "node:crypto";
 
@@ -32,7 +35,7 @@ type State = {
   text: string;
 };
 
-export const DevinDriver: ProviderDriver<typeof DevinSettings.Type> = {
+export const DevinDriver: ProviderDriver<typeof DevinSettings.Type, ServerConfig> = {
   driverKind: provider,
   metadata: { displayName: "Devin", supportsMultipleInstances: true },
   configSchema: DevinSettings,
@@ -44,6 +47,8 @@ export const DevinDriver: ProviderDriver<typeof DevinSettings.Type> = {
   }),
   create: ({ config, instanceId, displayName, accentColor, environment, enabled }) =>
     Effect.gen(function* () {
+      const serverConfig = yield* ServerConfig;
+      const host = { platform: yield* HostProcessPlatform, arch: yield* HostProcessArchitecture };
       const events = yield* Queue.unbounded<ProviderRuntimeEvent>();
       const sessions = new Map<ThreadId, State>();
       const emit = (event: ProviderRuntimeEvent) => {
@@ -167,6 +172,10 @@ export const DevinDriver: ProviderDriver<typeof DevinSettings.Type> = {
             if (!state.runtime) {
               state.runtime = new DevinOpenTurn({
                 cwd: state.session.cwd!,
+                runRoot: NodePath.join(serverConfig.stateDir, "providers", "devin", "runs"),
+                threadId: state.session.threadId,
+                providerInstanceId: instanceId,
+                host,
                 binary: config.binaryPath,
                 model: state.session.model!,
                 allowNativePrompt: config.allowNativePrompt,

@@ -1,7 +1,9 @@
+import { HostProcessPlatform, HostProcessArchitecture } from "@t3tools/shared/hostProcess";
+import { buildDevinConfig, verifyDevinBinary } from "./DevinLaunchConfig.ts";
 import * as NodeReadline from "node:readline";
 import * as NodeNet from "node:net";
 import * as NodeChildProcess from "node:child_process";
-import * as NodeURL from "node:url";
+import { hookSource } from "./hookSource.ts";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeFSP from "node:fs/promises";
@@ -29,17 +31,23 @@ export class DevinOpenTurn {
   private firstTask: string | undefined;
   private promptId?: string;
   private sessionId?: string;
-  private maintenance: "compact" | "fresh" | undefined;
+  private maintenance: "compact" | undefined;
   private pending = new Map<
     number,
     { resolve: (value: RecordValue) => void; reject: (e: Error) => void }
   >();
   private sequence = 0;
   private promptSent = false;
+  readonly runId = NodeCrypto.randomUUID();
+  private hookToken = NodeCrypto.randomBytes(32).toString("hex");
   private state: string;
   private socketPath = NodePath.join(NodeOS.tmpdir(), `t3-devin-${NodeCrypto.randomUUID()}.sock`);
   private options: {
     cwd: string;
+    runRoot: string;
+    threadId: string;
+    providerInstanceId: string;
+    host?: { platform: NodeJS.Platform; arch: NodeJS.Architecture };
     binary: string;
     model: string;
     allowNativePrompt: boolean;
@@ -51,7 +59,7 @@ export class DevinOpenTurn {
   };
   constructor(options: DevinOpenTurn["options"]) {
     this.options = options;
-    this.state = NodePath.join(options.cwd, ".devin-worker");
+    this.state = NodePath.join(options.runRoot, this.runId);
   }
 
   private fail(message: string) {
@@ -83,10 +91,25 @@ export class DevinOpenTurn {
     const lines = NodeReadline.createInterface({ input: socket });
     lines.once("line", (line) => {
       try {
-        const data = record(JSON.parse(line));
-        void NodeFSP.appendFile(NodePath.join(this.state, "hooks.jsonl"), line + "\n").catch(() =>
-          this.fail("Hook evidence could not be saved."),
-        );
+        const envelope = record(JSON.parse(line));
+        if (envelope.token !== this.hookToken) {
+          socket.destroy();
+          return;
+        }
+        const data = record(envelope.event);
+        if (this.phase === "ended") return;
+        if (
+          data.session_id !== this.sessionId ||
+          !data.prompt_id ||
+          (this.promptId && data.prompt_id !== this.promptId)
+        ) {
+          this.fail("Native hook identity does not match this run. No continuation sent.");
+          return;
+        }
+        void NodeFSP.appendFile(
+          NodePath.join(this.state, "hooks.jsonl"),
+          JSON.stringify(data) + "\n",
+        ).catch(() => this.fail("Hook evidence could not be saved."));
         if (data.hook_event_name === "PreToolUse") {
           const response = this.cancelRequested
             ? {
@@ -106,10 +129,6 @@ export class DevinOpenTurn {
         this.promptId = promptId;
         if (data.hook_event_name === "PostCompaction") {
           const summary = String(data.summary ?? "");
-          if (this.maintenance === "fresh" && !summary.startsWith("Fresh task context.")) {
-            this.fail("Native clear was not confirmed. Hook remains blocked.");
-            return;
-          }
           this.options.onEvent({ type: "context", mode: this.maintenance ?? "automatic", summary });
           this.maintenance = undefined;
           socket.end("{}\n");
@@ -119,7 +138,7 @@ export class DevinOpenTurn {
           socket.end("{}\n");
           return;
         }
-        if (this.phase === "ended" || this.waiting) {
+        if (this.waiting) {
           this.fail("Unexpected Stop hook; no continuation sent.");
           return;
         }
@@ -156,7 +175,18 @@ export class DevinOpenTurn {
     )
       throw new Error("Compaction threshold must be a positive whole number.");
     if (this.phase !== "new") throw new Error("This native run cannot be restarted.");
-    // Exclusive directory ownership also prevents attaching to an existing Devin worker.
+    if (!this.options.args)
+      await verifyDevinBinary(
+        this.options.binary,
+        this.options.host ?? {
+          platform: HostProcessPlatform.defaultValue(),
+          arch: HostProcessArchitecture.defaultValue(),
+        },
+      );
+    // Never share control state or infer run identity from the project directory.
+    if (!NodePath.isAbsolute(this.options.runRoot))
+      throw new Error("Devin run root must be absolute.");
+    await NodeFSP.mkdir(this.options.runRoot, { recursive: true, mode: 0o700 });
     await NodeFSP.mkdir(this.state, { mode: 0o700 });
     this.server = NodeNet.createServer((socket) => this.onHook(socket));
     await new Promise<void>((resolve, reject) => {
@@ -167,36 +197,55 @@ export class DevinOpenTurn {
     const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
     const command = [
       process.execPath,
-      NodeURL.fileURLToPath(new URL("./hook.mjs", import.meta.url)),
+      NodePath.join(this.state, "hook.mjs"),
       this.socketPath,
+      this.hookToken,
     ]
       .map(quote)
       .join(" ");
+    await NodeFSP.writeFile(NodePath.join(this.state, "hook.mjs"), hookSource, { mode: 0o600 });
     const configPath = NodePath.join(this.state, "config.json");
     await NodeFSP.writeFile(
       configPath,
-      JSON.stringify({
-        auto_update: false,
-        subagents_enabled: false,
-        ...(this.options.compactionThresholdTokens === undefined
-          ? {}
-          : { agent: { compaction_threshold_tokens: this.options.compactionThresholdTokens } }),
-        hooks: Object.fromEntries(
-          ["Stop", "PostCompaction", "PreToolUse"].map((name) => [
-            name,
-            [{ hooks: [{ type: "command", command, timeout: 315360000 }] }],
-          ]),
-        ),
-      }),
+      JSON.stringify(
+        await buildDevinConfig({
+          cwd: this.options.cwd,
+          environment: this.options.environment ?? process.env,
+          hookCommand: command,
+          model: this.options.model,
+          compactionThresholdTokens: this.options.compactionThresholdTokens,
+        }),
+      ),
       { mode: 0o600 },
     );
+    const launchEnvironment = { ...(this.options.environment ?? process.env) };
+    for (const key of Object.keys(launchEnvironment)) {
+      if (key.startsWith("DEVIN_CONTROL_")) delete launchEnvironment[key];
+    }
+    Object.assign(launchEnvironment, {
+      DEVIN_CONTROL_DIR: this.state,
+      DEVIN_CONTROL_RUN_ID: this.runId,
+      DEVIN_CONTROL_ABI: "1",
+    });
+    // exec preserves the shell PID; inherited child settings retain that owner's PID.
     this.child = NodeChildProcess.spawn(
-      this.options.binary,
-      [...(this.options.args ?? []), "--config", configPath, "acp", "--model", this.options.model],
+      "/bin/sh",
+      [
+        "-c",
+        'export DEVIN_CONTROL_OWNER_PID=$$; exec "$@"',
+        "t3-devin",
+        this.options.binary,
+        ...(this.options.args ?? []),
+        "--config",
+        configPath,
+        "acp",
+        "--model",
+        this.options.model,
+      ],
       {
         cwd: this.options.cwd,
         detached: true,
-        env: this.options.environment ?? process.env,
+        env: launchEnvironment,
         stdio: "pipe",
       },
     );
@@ -218,7 +267,14 @@ export class DevinOpenTurn {
           if (message.error) request.reject(new Error(JSON.stringify(message.error)));
           else request.resolve(record(message.result));
         } else if (message.method === "session/update") {
-          const update = record(record(message.params).update);
+          const params = record(message.params);
+          // Devin sends config updates before session/new returns its identity.
+          if (!this.sessionId) return;
+          if (params.sessionId !== this.sessionId) {
+            this.fail("Native update identity does not match this run.");
+            return;
+          }
+          const update = record(params.update);
           const content = record(update.content);
           if (
             update.sessionUpdate === "agent_message_chunk" &&
@@ -241,6 +297,18 @@ export class DevinOpenTurn {
         this.fail("Malformed native ACP message.");
       }
     });
+    await NodeFSP.writeFile(
+      NodePath.join(this.state, "identity.json"),
+      JSON.stringify({
+        runId: this.runId,
+        threadId: this.options.threadId,
+        providerInstanceId: this.options.providerInstanceId,
+        cwd: this.options.cwd,
+        pid: this.child.pid,
+        status: "starting",
+      }),
+      { mode: 0o600 },
+    );
     await this.rpc("initialize", {
       protocolVersion: 1,
       clientCapabilities: {},
@@ -258,6 +326,19 @@ export class DevinOpenTurn {
       );
     if (typeof session.sessionId !== "string") throw new Error("ACP did not return a session ID.");
     this.sessionId = session.sessionId;
+    await NodeFSP.writeFile(
+      NodePath.join(this.state, "identity.json"),
+      JSON.stringify({
+        runId: this.runId,
+        threadId: this.options.threadId,
+        providerInstanceId: this.options.providerInstanceId,
+        cwd: this.options.cwd,
+        pid: this.child.pid,
+        sessionId: this.sessionId,
+        status: "connected",
+      }),
+      { mode: 0o600 },
+    );
   }
   async submit(text: string) {
     if (!text.trim()) throw new Error("Message is empty.");
@@ -273,7 +354,7 @@ export class DevinOpenTurn {
         prompt: [
           {
             type: "text",
-            text: "Reply READY and let the Stop hook wait. Tasks arrive through that hook. Complete each task, then let the Stop hook wait again. Never start another prompt or poll for work. Do not recover earlier tasks after a context clear.",
+            text: "Reply READY and let the Stop hook wait. Tasks arrive through that hook. Complete each task, then let the Stop hook wait again. Never start another prompt or poll for work.",
           },
         ],
       }).then(
@@ -287,11 +368,10 @@ export class DevinOpenTurn {
       this.waiting = undefined;
     }
   }
-  async context(mode: "compact" | "fresh") {
+  async context(mode: "compact") {
     if (this.phase !== "waiting" || !this.waiting)
       throw new Error("Context actions require the waiting Stop hook.");
     this.cancelRequested = false;
-    if (mode === "fresh") await NodeFSP.writeFile(NodePath.join(this.state, "fresh.request"), "");
     await NodeFSP.writeFile(NodePath.join(this.state, "compact.request"), "");
     this.maintenance = mode;
     this.phase = "context";

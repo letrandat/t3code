@@ -8,17 +8,22 @@ import * as NodeAssert from "node:assert/strict";
 
 import { DevinOpenTurn, type DevinEvent } from "./DevinOpenTurn.ts";
 
-async function setup(t: { after: (fn: () => void) => void }) {
-  const cwd = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-devin-NodeTest.test-"));
+async function setup(t: { after: (fn: () => void) => void }, sharedCwd?: string) {
+  const cwd =
+    sharedCwd ?? (await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-devin-NodeTest.test-")));
   const events: DevinEvent[] = [];
   let wake: (() => void) | undefined;
   const runtime = new DevinOpenTurn({
     cwd,
+    runRoot: NodePath.join(cwd, "runs"),
+    threadId: "test-thread",
+    providerInstanceId: "test-provider",
     binary: process.execPath,
     args: [NodeURL.fileURLToPath(new URL("./testFixtures/fakeDevin.mjs", import.meta.url))],
     model: "fake-model",
     allowNativePrompt: true,
     compactionThresholdTokens: 240000,
+    environment: { ...process.env, HOME: cwd },
     onEvent: (event) => {
       events.push(event);
       wake?.();
@@ -49,7 +54,7 @@ NodeTest.test(
     await runtime.submit("SECOND");
     NodeAssert.match(((await take("text")) as { text: string }).text, /SECOND/);
     NodeAssert.deepEqual(await take("waiting"), first);
-    for (const mode of ["compact", "fresh"] as const) {
+    for (const mode of ["compact"] as const) {
       await runtime.context(mode);
       await NodeAssert.rejects(runtime.submit("too early"), /busy/);
       const event = await take("context");
@@ -59,7 +64,7 @@ NodeTest.test(
     await runtime.submit("THIRD");
     await take("waiting");
     const protocol = (
-      await NodeFSP.readFile(NodePath.join(cwd, ".devin-worker/protocol.jsonl"), "utf8")
+      await NodeFSP.readFile(NodePath.join(cwd, "runs", runtime.runId, "protocol.jsonl"), "utf8")
     )
       .trim()
       .split("\n")
@@ -72,7 +77,7 @@ NodeTest.test(
     );
     NodeAssert.equal(sent.filter((entry) => entry.message.method === "session/cancel").length, 0);
     const config = JSON.parse(
-      await NodeFSP.readFile(NodePath.join(cwd, ".devin-worker/config.json"), "utf8"),
+      await NodeFSP.readFile(NodePath.join(cwd, "runs", runtime.runId, "config.json"), "utf8"),
     );
     NodeAssert.equal(config.agent.compaction_threshold_tokens, 240000);
   },
@@ -108,7 +113,10 @@ NodeTest.test(
       resumed.type === "waiting" && resumed.promptId,
       stopped.type === "waiting" && stopped.promptId,
     );
-    const log = await NodeFSP.readFile(NodePath.join(cwd, ".devin-worker/protocol.jsonl"), "utf8");
+    const log = await NodeFSP.readFile(
+      NodePath.join(cwd, "runs", runtime.runId, "protocol.jsonl"),
+      "utf8",
+    );
     NodeAssert.equal(log.match(/"method":"session\/prompt"/g)?.length, 1);
     NodeAssert.doesNotMatch(log, /session\/cancel/);
   },
@@ -118,6 +126,9 @@ NodeTest.test("unapproved runs never launch native ACP", async () => {
   const cwd = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-devin-denied-"));
   const runtime = new DevinOpenTurn({
     cwd,
+    runRoot: NodePath.join(cwd, "runs"),
+    threadId: "test-thread",
+    providerInstanceId: "test-provider",
     binary: "/does/not/exist",
     model: "none",
     allowNativePrompt: false,
@@ -125,3 +136,71 @@ NodeTest.test("unapproved runs never launch native ACP", async () => {
   });
   await NodeAssert.rejects(runtime.start(), /disabled/);
 });
+
+NodeTest.test(
+  "two runs share cwd while output, compact and shutdown stay separate",
+  { timeout: 10000 },
+  async (t) => {
+    const a = await setup(t);
+    const b = await setup(t, a.cwd);
+    NodeAssert.notEqual(a.runtime.runId, b.runtime.runId);
+    await Promise.all([a.runtime.submit("TASK_A"), b.runtime.submit("TASK_B")]);
+    const [wa, wb] = await Promise.all([a.take("waiting"), b.take("waiting")]);
+    NodeAssert.notDeepEqual(wa, wb);
+    NodeAssert.match(((await a.take("text")) as { text: string }).text, /TASK_A/);
+    NodeAssert.match(((await b.take("text")) as { text: string }).text, /TASK_B/);
+    await Promise.all([a.runtime.context("compact"), b.runtime.context("compact")]);
+    await Promise.all([a.take("context"), b.take("context")]);
+    await Promise.all([a.take("waiting"), b.take("waiting")]);
+    a.runtime.close();
+    await b.runtime.submit("B_STILL_ALIVE");
+    await b.take("waiting");
+    NodeAssert.match(((await b.take("text")) as { text: string }).text, /B_STILL_ALIVE/);
+    for (const item of [a, b]) {
+      const state = NodePath.join(item.cwd, "runs", item.runtime.runId);
+      const log = await NodeFSP.readFile(NodePath.join(state, "protocol.jsonl"), "utf8");
+      NodeAssert.equal(log.match(/"method":"session\/prompt"/g)?.length, 1);
+      NodeAssert.doesNotMatch(log, /session\/cancel/);
+      const identity = JSON.parse(
+        await NodeFSP.readFile(NodePath.join(state, "identity.json"), "utf8"),
+      );
+      NodeAssert.equal(identity.cwd, a.cwd);
+      NodeAssert.equal(identity.runId, item.runtime.runId);
+    }
+    await NodeAssert.rejects(NodeFSP.stat(NodePath.join(a.cwd, ".devin-worker")), {
+      code: "ENOENT",
+    });
+  },
+);
+
+NodeTest.test(
+  "stopping A does not cancel a working B in the same cwd",
+  { timeout: 10000 },
+  async (t) => {
+    const a = await setup(t);
+    const b = await setup(t, a.cwd);
+    await Promise.all([
+      a.runtime.submit("LONG_TOOL_ISOLATED"),
+      b.runtime.submit("LONG_TOOL_ISOLATED"),
+    ]);
+    await Promise.all([a.take("text"), b.take("text")]);
+    a.runtime.softCancel();
+    await NodeFSP.writeFile(NodePath.join(a.cwd, "runs", a.runtime.runId, "release-tool"), "");
+    const stopped = await a.take("waiting");
+    NodeAssert.equal(stopped.type === "waiting" && stopped.cancelled, true);
+    await NodeAssert.rejects(
+      NodeFSP.stat(NodePath.join(b.cwd, "runs", b.runtime.runId, "tool-result.json")),
+      { code: "ENOENT" },
+    );
+    await NodeFSP.writeFile(NodePath.join(b.cwd, "runs", b.runtime.runId, "release-tool"), "");
+    const continued = await b.take("waiting");
+    NodeAssert.equal(continued.type === "waiting" && continued.cancelled, false);
+    const result = JSON.parse(
+      await NodeFSP.readFile(
+        NodePath.join(b.cwd, "runs", b.runtime.runId, "tool-result.json"),
+        "utf8",
+      ),
+    );
+    NodeAssert.equal(result.decision, undefined);
+  },
+);

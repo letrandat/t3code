@@ -1,3 +1,7 @@
+import { HostProcessPlatform, HostProcessArchitecture } from "@t3tools/shared/hostProcess";
+import * as NodeCrypto from "node:crypto";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import { ServerConfig } from "../../config.ts";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 import * as NodeOS from "node:os";
@@ -24,6 +28,19 @@ it.effect(
           mode: 0o700,
         }),
       );
+      const binaryBytes = yield* Effect.promise(() => NodeFSP.readFile(binaryPath));
+      yield* Effect.promise(() =>
+        NodeFSP.writeFile(
+          binaryPath + ".manifest.json",
+          JSON.stringify({
+            control_abi: 1,
+            owner_check: "pid",
+            clear: false,
+            capabilities: ["private-control-directory", "owner-pid", "compact"],
+            output_sha256: NodeCrypto.createHash("sha256").update(binaryBytes).digest("hex"),
+          }),
+        ),
+      );
       const instanceId = ProviderInstanceId.make("devin-test");
       const threadId = ThreadId.make("devin-thread");
       const events: ProviderRuntimeEvent[] = [];
@@ -42,7 +59,7 @@ it.effect(
           const instance = yield* DevinDriver.create({
             instanceId,
             displayName: "Devin test",
-            environment: [],
+            environment: [{ name: "HOME", value: cwd, sensitive: false }],
             enabled: true,
             config: {
               binaryPath,
@@ -50,7 +67,12 @@ it.effect(
               allowNativePrompt: true,
               compactionThresholdTokens: "240000",
             },
-          });
+          }).pipe(
+            Effect.provide(ServerConfig.layerTest(cwd, NodePath.join(cwd, "t3-home"))),
+            Effect.provide(NodeServices.layer),
+            Effect.provideService(HostProcessPlatform, "darwin"),
+            Effect.provideService(HostProcessArchitecture, "arm64"),
+          );
           yield* Stream.runForEach(instance.adapter.streamEvents, (event) =>
             Effect.sync(() => {
               events.push(event);
@@ -59,10 +81,12 @@ it.effect(
           ).pipe(Effect.forkScoped);
           yield* instance.adapter.startSession({ threadId, cwd, runtimeMode: "approval-required" });
           const first = yield* instance.adapter.sendTurn({ threadId, input: "FIRST" });
-        const completed = yield* Effect.promise(() => take("turn.completed"));
-        expect(completed.turnId).toBe(first.turnId);
-        const clear = yield* instance.adapter.sendTurn({ threadId, input: "/clear" }).pipe(Effect.exit);
-        expect(clear._tag).toBe("Failure");
+          const completed = yield* Effect.promise(() => take("turn.completed"));
+          expect(completed.turnId).toBe(first.turnId);
+          const clear = yield* instance.adapter
+            .sendTurn({ threadId, input: "/clear" })
+            .pipe(Effect.exit);
+          expect(clear._tag).toBe("Failure");
           const second = yield* instance.adapter.sendTurn({ threadId, input: "LONG_TOOL" });
           // Consume previous deltas before awaiting the long-tool marker.
           while (true) {
@@ -82,8 +106,11 @@ it.effect(
           yield* instance.adapter.sendTurn({ threadId, input: "/compact" });
           yield* Effect.promise(() => take("thread.state.changed"));
           yield* Effect.promise(() => take("turn.completed"));
+          const runRoot = NodePath.join(cwd, "t3-home", "userdata", "providers", "devin", "runs");
+          const runs = yield* Effect.promise(() => NodeFSP.readdir(runRoot));
+          expect(runs).toHaveLength(1);
           const log = yield* Effect.promise(() =>
-            NodeFSP.readFile(NodePath.join(cwd, ".devin-worker/protocol.jsonl"), "utf8"),
+            NodeFSP.readFile(NodePath.join(runRoot, runs[0]!, "protocol.jsonl"), "utf8"),
           );
           expect(log.match(/"method":"session\/prompt"/g)).toHaveLength(1);
           expect(log).not.toContain("session/cancel");
