@@ -23,6 +23,7 @@ async function setup(t: { after: (fn: () => void) => void }, sharedCwd?: string)
     model: "fake-model",
     allowNativePrompt: true,
     compactionThresholdTokens: 240000,
+    environment: { ...process.env, HOME: cwd },
     onEvent: (event) => {
       events.push(event);
       wake?.();

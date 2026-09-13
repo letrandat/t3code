@@ -1,3 +1,4 @@
+import * as NodeCrypto from "node:crypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { ServerConfig } from "../../config.ts";
 import * as NodeFSP from "node:fs/promises";
@@ -26,6 +27,19 @@ it.effect(
           mode: 0o700,
         }),
       );
+      const binaryBytes = yield* Effect.promise(() => NodeFSP.readFile(binaryPath));
+      yield* Effect.promise(() =>
+        NodeFSP.writeFile(
+          binaryPath + ".manifest.json",
+          JSON.stringify({
+            control_abi: 1,
+            owner_check: "pid",
+            clear: false,
+            capabilities: ["private-control-directory", "owner-pid", "compact"],
+            output_sha256: NodeCrypto.createHash("sha256").update(binaryBytes).digest("hex"),
+          }),
+        ),
+      );
       const instanceId = ProviderInstanceId.make("devin-test");
       const threadId = ThreadId.make("devin-thread");
       const events: ProviderRuntimeEvent[] = [];
@@ -44,7 +58,7 @@ it.effect(
           const instance = yield* DevinDriver.create({
             instanceId,
             displayName: "Devin test",
-            environment: [],
+            environment: [{ name: "HOME", value: cwd, sensitive: false }],
             enabled: true,
             config: {
               binaryPath,
