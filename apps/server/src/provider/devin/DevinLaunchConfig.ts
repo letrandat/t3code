@@ -3,7 +3,7 @@ import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeOS from "node:os";
 import * as NodeCrypto from "node:crypto";
-import { parse, type ParseError } from "jsonc-parser/lib/esm/main.js";
+import { parse, type ParseError } from "jsonc-parser";
 
 type JsonObject = Record<string, unknown>;
 async function readConfig(path: string): Promise<JsonObject> {
