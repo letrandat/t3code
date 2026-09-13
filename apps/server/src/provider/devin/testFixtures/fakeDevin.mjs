@@ -11,15 +11,19 @@ const model = process.argv.includes("--model")
   : "fake";
 if (process.argv.includes("models")) {
   console.log(
-    JSON.stringify({
-      families: [
-        {
-          family_uid: "fake",
-          family_label: "Fake",
-          variants: [{ model_uid: "fake", label: "Fake" }],
-        },
-      ],
-    }),
+    JSON.stringify(
+      process.env.DEVIN_TEST_CATALOG_FILE
+        ? JSON.parse(await NodeFSP.readFile(process.env.DEVIN_TEST_CATALOG_FILE, "utf8"))
+        : {
+            families: [
+              {
+                family_uid: "fake",
+                family_label: "Fake",
+                variants: [{ model_uid: "fake", label: "Fake" }],
+              },
+            ],
+          },
+    ),
   );
   process.exit(0);
 }

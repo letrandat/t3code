@@ -146,7 +146,7 @@ export function buildDevinModelCatalog(
       name: text(family.family_label) || slug,
       isCustom: false,
       isDefault: choices.some((v) => v.id === defaultId),
-      capabilities: { optionDescriptors, optionCombinations: visibleChoices.map((v) => v.options) },
+      capabilities: { optionDescriptors },
     });
   }
   if (!models.length || ![...variants.values()].flat().some((v) => v.id === defaultId))

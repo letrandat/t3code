@@ -124,8 +124,6 @@ function canonicalSelectionsToLegacyObject(
 
 export const ModelCapabilities = Schema.Struct({
   optionDescriptors: Schema.optional(Schema.Array(ProviderOptionDescriptor)),
-  // Ordered combinations restrict later selectors using the earlier selections.
-  optionCombinations: Schema.optional(Schema.Array(Schema.Array(ProviderOptionSelection))),
 });
 export type ModelCapabilities = typeof ModelCapabilities.Type;
 

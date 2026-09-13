@@ -2,7 +2,7 @@
 
 This first release supports a separately built private-control Devin binary on macOS ARM64. Build Devin 3000.10.21 with `patch_t3.py` from [devin-continuous](https://github.com/letrandat/devin-continuous), keeping its generated manifest next to the binary. In **Settings > Providers**, add Devin, select that binary path and model, and enable native prompts. The existing pool installation can stay in place.
 
-T3 discovers the models offered to your Devin account on the connected server. Settings supplies the default exact model ID; the chat picker can select another allowed model for a new thread. If discovery fails, new threads are blocked. Use **Settings > Providers > Refresh provider status** to retry.
+T3 discovers the models offered to your Devin account on the connected server. In **Settings > Providers > Devin > Models**, show or hide models in the picker using the existing visibility controls. Visibility preferences are saved on this device. Settings supplies the default exact model ID; the chat picker can select another allowed model for a new thread. If discovery fails, new threads are blocked. Use **Settings > Providers > Refresh provider status** to retry.
 
 Each T3 thread starts its own Devin run in the actual project directory. Replies reuse that run's open native prompt. Two threads can share a project, but they still edit the same files. Their control files, hooks and logs live in separate folders under the T3 environment's state directory.
 
