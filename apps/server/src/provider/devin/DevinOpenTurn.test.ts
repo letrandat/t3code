@@ -21,7 +21,6 @@ async function setup(t: { after: (fn: () => void) => void }, sharedCwd?: string)
     binary: process.execPath,
     args: [NodeURL.fileURLToPath(new URL("./testFixtures/fakeDevin.mjs", import.meta.url))],
     model: "fake-model",
-    allowNativePrompt: true,
     compactionThresholdTokens: 240000,
     environment: { ...process.env, HOME: cwd },
     onEvent: (event) => {
@@ -121,21 +120,6 @@ NodeTest.test(
     NodeAssert.doesNotMatch(log, /session\/cancel/);
   },
 );
-
-NodeTest.test("unapproved runs never launch native ACP", async () => {
-  const cwd = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-devin-denied-"));
-  const runtime = new DevinOpenTurn({
-    cwd,
-    runRoot: NodePath.join(cwd, "runs"),
-    threadId: "test-thread",
-    providerInstanceId: "test-provider",
-    binary: "/does/not/exist",
-    model: "none",
-    allowNativePrompt: false,
-    onEvent: () => {},
-  });
-  await NodeAssert.rejects(runtime.start(), /disabled/);
-});
 
 NodeTest.test(
   "two runs share cwd while output, compact and shutdown stay separate",

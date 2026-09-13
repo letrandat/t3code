@@ -77,7 +77,6 @@ export class DevinOpenTurn {
     host?: { platform: NodeJS.Platform; arch: NodeJS.Architecture };
     binary: string;
     model: string;
-    allowNativePrompt: boolean;
     environment?: NodeJS.ProcessEnv;
     compactionThresholdTokens?: number | undefined;
     onEvent: (event: DevinEvent) => void;
@@ -194,8 +193,6 @@ export class DevinOpenTurn {
     });
   }
   async start() {
-    if (!this.options.allowNativePrompt)
-      throw new Error("Native Devin prompt is disabled. Enable only after approving a test run.");
     if (
       this.options.compactionThresholdTokens !== undefined &&
       (!Number.isSafeInteger(this.options.compactionThresholdTokens) ||

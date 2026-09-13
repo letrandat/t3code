@@ -9,8 +9,10 @@ import * as NodeURL from "node:url";
 import { it, expect } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Stream from "effect/Stream";
+import * as Schema from "effect/Schema";
 import {
   ApprovalRequestId,
+  DevinSettings,
   ProviderInstanceId,
   ThreadId,
   type ProviderRuntimeEvent,
@@ -80,12 +82,13 @@ it.effect(
               { name: "DEVIN_TEST_CATALOG_FILE", value: catalogPath, sensitive: false },
             ],
             enabled: true,
-            config: {
+            config: Schema.decodeUnknownSync(DevinSettings)({
               binaryPath,
               model: "fake",
-              allowNativePrompt: true,
+              // Older saved settings must no longer block the first message.
+              allowNativePrompt: false,
               compactionThresholdTokens: "240000",
-            },
+            }),
           }).pipe(
             Effect.provide(ServerConfig.layerTest(cwd, NodePath.join(cwd, "t3-home"))),
             Effect.provide(NodeServices.layer),

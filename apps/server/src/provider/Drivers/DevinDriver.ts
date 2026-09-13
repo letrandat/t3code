@@ -55,8 +55,7 @@ export const DevinDriver: ProviderDriver<typeof DevinSettings.Type, ServerConfig
   defaultConfig: () => ({
     binaryPath: "",
     model: "",
-    allowNativePrompt: false,
-    compactionThresholdTokens: "",
+    compactionThresholdTokens: "240000",
   }),
   create: ({ config, instanceId, displayName, accentColor, environment, enabled }) =>
     Effect.gen(function* () {
@@ -251,7 +250,6 @@ export const DevinDriver: ProviderDriver<typeof DevinSettings.Type, ServerConfig
                 host,
                 binary: config.binaryPath,
                 model: state.session.model!,
-                allowNativePrompt: config.allowNativePrompt,
                 environment: mergeProviderInstanceEnvironment(environment),
                 compactionThresholdTokens: config.compactionThresholdTokens
                   ? Number(config.compactionThresholdTokens)
@@ -342,16 +340,11 @@ export const DevinDriver: ProviderDriver<typeof DevinSettings.Type, ServerConfig
             probe: {
               installed: NodeFS.existsSync(config.binaryPath),
               version: null,
-              status:
-                config.allowNativePrompt && catalog && NodeFS.existsSync(config.binaryPath)
-                  ? "ready"
-                  : "warning",
+              status: catalog && NodeFS.existsSync(config.binaryPath) ? "ready" : "warning",
               auth: { status: "unknown" },
               message:
                 discoveryError ||
-                (config.allowNativePrompt
-                  ? "Chat preview with file references and permission approvals. Uses one native turn per workspace."
-                  : "Native prompts disabled until approved."),
+                "Chat preview with file references and permission approvals. Uses one native turn per workspace.",
             },
           }),
         );

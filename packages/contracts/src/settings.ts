@@ -716,21 +716,15 @@ export const DevinSettings = makeProviderSettingsSchema({
     Schema.annotateKey({
       title: "Model",
       description: "Exact model ID from Devin's model list.",
-    }),
-  ),
-  allowNativePrompt: Schema.Boolean.pipe(
-    Schema.withDecodingDefault(Effect.succeed(false)),
-    Schema.annotateKey({
-      title: "Allow a native prompt",
-      description: "Each new workspace starts one native turn. Chat follow-ups reuse that turn.",
-      providerSettingsForm: { control: "switch", clearWhenEmpty: "persist" },
+      providerSettingsForm: { hidden: true },
     }),
   ),
   compactionThresholdTokens: Schema.String.pipe(
-    Schema.withDecodingDefault(Effect.succeed("")),
+    Schema.withDecodingDefault(Effect.succeed("240000")),
     Schema.annotateKey({
       title: "Automatic compact at tokens",
-      description: "Optional earlier trigger, for example 240000. Empty uses Devin's default.",
+      description: "Defaults to 240000 tokens. Empty uses Devin's default.",
+      providerSettingsForm: { placeholder: "240000", clearWhenEmpty: "persist" },
     }),
   ),
 });
