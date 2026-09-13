@@ -78,6 +78,7 @@ async function run(text) {
 createInterface({ input: process.stdin }).on("line", (line) => {
   const message = JSON.parse(line);
   if (message.method === "initialize") send({ id: message.id, result: { protocolVersion: 1 } });
+  if (message.method === "session/new") update("EARLY_CONFIG_UPDATE");
   if (message.method === "session/new")
     send({
       id: message.id,
