@@ -8,7 +8,11 @@ import * as NodeAssert from "node:assert/strict";
 
 import { DevinOpenTurn, type DevinEvent } from "./DevinOpenTurn.ts";
 
-async function setup(t: { after: (fn: () => void) => void }, sharedCwd?: string) {
+async function setup(
+  t: { after: (fn: () => void) => void },
+  sharedCwd?: string,
+  runtimeMode?: DevinOpenTurn["options"]["runtimeMode"],
+) {
   const cwd =
     sharedCwd ?? (await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-devin-NodeTest.test-")));
   const events: DevinEvent[] = [];
@@ -23,15 +27,16 @@ async function setup(t: { after: (fn: () => void) => void }, sharedCwd?: string)
     model: "fake-model",
     compactionThresholdTokens: 240000,
     environment: { ...process.env, HOME: cwd },
+    ...(runtimeMode ? { runtimeMode } : {}),
     onEvent: (event) => {
       events.push(event);
       wake?.();
     },
   });
   t.after(() => runtime.close());
-  const take = async (type: DevinEvent["type"]) => {
+  const take = async (...types: DevinEvent["type"][]) => {
     while (true) {
-      const index = events.findIndex((event) => event.type === type);
+      const index = events.findIndex((event) => types.includes(event.type));
       if (index >= 0) return events.splice(index, 1)[0]!;
       await new Promise<void>((resolve) => {
         wake = resolve;
@@ -223,6 +228,45 @@ NodeTest.test(
       /did not offer/,
     );
     await runtime.respondToPermission(empty.requestId, "cancel");
+    await take("waiting");
+  },
+);
+
+NodeTest.test(
+  "full-access auto-selects allow_always without a permission event",
+  { timeout: 10000 },
+  async (t) => {
+    const { runtime, take } = await setup(t, undefined, "full-access");
+    await runtime.submit("ASK_PERMISSION");
+    const result = await take("text", "permission");
+    NodeAssert.equal(result.type, "text");
+    NodeAssert.equal(
+      result.type === "text" && result.text,
+      'PERMISSION_RESULT:{"outcome":{"outcome":"selected","optionId":"always-id"}}',
+    );
+    await take("waiting");
+  },
+);
+
+NodeTest.test(
+  "auto-accept edits auto-selects file changes and still asks for commands",
+  { timeout: 10000 },
+  async (t) => {
+    const { runtime, take } = await setup(t, undefined, "auto-accept-edits");
+    await runtime.submit("ASK_PERMISSION EDIT");
+    const edit = await take("text", "permission");
+    NodeAssert.equal(edit.type, "text");
+    NodeAssert.equal(
+      edit.type === "text" && edit.text,
+      'PERMISSION_RESULT:{"outcome":{"outcome":"selected","optionId":"always-id"}}',
+    );
+    await take("waiting");
+    await runtime.submit("ASK_PERMISSION");
+    const command = await take("permission");
+    NodeAssert.equal(command.type, "permission");
+    if (command.type !== "permission") return;
+    await runtime.respondToPermission(command.requestId, "accept");
+    await take("permission-resolved");
     await take("waiting");
   },
 );

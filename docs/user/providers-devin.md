@@ -10,7 +10,7 @@ Use **Stop** to request a soft cancel. Devin finishes a running tool and blocks 
 
 Attach files or images in the composer, with or without a text message. T3 saves uploads on the connected server and gives Devin file paths to read with its tools. Images are file references, not embedded image content in the native prompt.
 
-When Devin requests permission, choose one of its offered options in T3. Requests wait for your answer and are never silently approved. Stop cancels a pending permission request; ending the session clears it.
+Permission requests follow the thread's permission mode. **Full access** auto-approves offered allow options. **Auto-accept edits** auto-approves file changes and still asks for other actions. Other modes wait for you to choose one of Devin's offered options. Switching modes mid-thread applies to later requests without a new thread; only model changes need one. Stop cancels a pending permission request; ending the session clears it.
 
 T3 copies ordinary user settings into each run's configuration and replaces user hooks with its managed hooks. It leaves original settings and `AGENTS.md` files unchanged. Projects with Devin hooks in `.devin/config.json`, `.devin/config.local.json` or `.devin/hooks.v1.json`, including ancestor directories, are refused before a prompt starts. Project hook replacement is outside this first release. Do not enable additional plugin or organization hooks for this provider; those hook sources are not covered by the startup check. Separate MCP configuration remains subject to Devin's normal discovery.
 

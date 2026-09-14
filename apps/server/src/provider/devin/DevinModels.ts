@@ -156,6 +156,17 @@ export function buildDevinModelCatalog(
   return { models, variants, defaultId };
 }
 
+/** Find the picker family slug containing a native variant id, if any. */
+export function familySlugForNativeId(
+  catalog: DevinModelCatalog,
+  nativeId: string,
+): string | undefined {
+  for (const [slug, variants] of catalog.variants) {
+    if (variants.some((variant) => variant.id === nativeId)) return slug;
+  }
+  return undefined;
+}
+
 export function resolveDevinModel(
   catalog: DevinModelCatalog,
   selection?: Pick<ModelSelection, "model" | "options">,

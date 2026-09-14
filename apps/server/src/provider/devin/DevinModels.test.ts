@@ -9,6 +9,7 @@ import {
   allowedDevinModels,
   buildDevinModelCatalog,
   discoverDevinModels,
+  familySlugForNativeId,
   resolveDevinModel,
 } from "./DevinModels.ts";
 
@@ -79,6 +80,11 @@ describe("DevinModels", () => {
       }),
     ).toThrow(/combination is not allowed/);
     expect(() => resolveDevinModel(catalog, { model: "hidden-model" })).toThrow(/not allowed/);
+    // A stored native variant id resolves back to itself, which is what the
+    // driver feeds through picker resolution when a thread started bare.
+    expect(resolveDevinModel(catalog, { model: "swe-1-6-high" })).toBe("swe-1-6-high");
+    expect(familySlugForNativeId(catalog, "swe-1-6-high-priority")).toBe("swe-1-6");
+    expect(familySlugForNativeId(catalog, "hidden-model")).toBeUndefined();
     expect(() => buildDevinModelCatalog(families, session, "hidden-model")).toThrow(
       /no longer allowed/,
     );
