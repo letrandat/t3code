@@ -408,3 +408,48 @@ it.effect(
     ),
   10000,
 );
+
+it.effect(
+  "permission-mode switches apply live without a new native run",
+  () =>
+    withFakeDevin(({ instance, cwd, take }) =>
+      Effect.gen(function* () {
+        const threadId = ThreadId.make("devin-mode-switch");
+        yield* instance.adapter.startSession({
+          threadId,
+          cwd,
+          runtimeMode: "approval-required",
+        });
+        const first = yield* instance.adapter.sendTurn({ threadId, input: "ASK_PERMISSION" });
+        const opened = yield* Effect.promise(() => take("request.opened"));
+        expect(opened.turnId).toBe(first.turnId);
+        const requestId = ApprovalRequestId.make(opened.requestId!);
+        yield* instance.adapter.respondToRequest(threadId, requestId, "cancel");
+        yield* Effect.promise(() => take("request.resolved"));
+        yield* Effect.promise(() => take("turn.completed"));
+        // Mid-thread mode switch syncs live instead of restarting the native run.
+        const updated = yield* instance.adapter.startSession({
+          threadId,
+          cwd,
+          runtimeMode: "full-access",
+        });
+        expect(updated.runtimeMode).toBe("full-access");
+        const second = yield* instance.adapter.sendTurn({ threadId, input: "ASK_PERMISSION" });
+        // Drain any leftover deltas from the first turn before asserting.
+        let auto = yield* Effect.promise(() => take("content.delta", "request.opened"));
+        while (auto.type === "content.delta" && auto.turnId !== second.turnId) {
+          auto = yield* Effect.promise(() => take("content.delta", "request.opened"));
+        }
+        expect(auto.type).toBe("content.delta");
+        expect(auto.turnId).toBe(second.turnId);
+        expect(auto.type === "content.delta" && auto.payload.delta).toBe(
+          'PERMISSION_RESULT:{"outcome":{"outcome":"selected","optionId":"always-id"}}',
+        );
+        yield* Effect.promise(() => take("turn.completed"));
+        const runRoot = NodePath.join(cwd, "t3-home", "userdata", "providers", "devin", "runs");
+        const runs = yield* Effect.promise(() => NodeFSP.readdir(runRoot));
+        expect(runs).toHaveLength(1);
+      }),
+    ),
+  10000,
+);

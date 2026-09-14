@@ -18,6 +18,7 @@ import {
 } from "@t3tools/contracts";
 import {
   discoverDevinModels,
+  familySlugForNativeId,
   resolveDevinModel,
   type DevinModelCatalog,
 } from "../devin/DevinModels.ts";
@@ -205,10 +206,44 @@ export const DevinDriver: ProviderDriver<typeof DevinSettings.Type, ServerConfig
         capabilities: { sessionModelSwitch: "unsupported", supportsConversationRollback: false },
         startSession: (input) =>
           request("startSession", async () => {
-            if (input.resumeCursor || sessions.has(input.threadId))
-              throw new Error("Automatic native restart/resume is disabled.");
-            if (!input.cwd) throw new Error("A workspace directory is required.");
             const now = new Date().toISOString();
+            const existing = sessions.get(input.threadId);
+            if (existing) {
+              // Permission-mode-only changes apply live. The native run cannot
+              // be torn down and resumed, but the mode is read per permission
+              // request, so sync it without touching native state. Anything
+              // else still needs an explicitly new thread. (Devin sessions
+              // carry no resume cursor, so the check is same-model/same-cwd,
+              // not cursor presence.)
+              const sameNative = (() => {
+                try {
+                  return (
+                    !input.modelSelection ||
+                    resolveDevinModel(existing.catalog, input.modelSelection) ===
+                      existing.nativeModel
+                  );
+                } catch {
+                  return false;
+                }
+              })();
+              const sameCwd =
+                !input.cwd ||
+                existing.session.cwd === undefined ||
+                NodePath.resolve(input.cwd.trim()) === NodePath.resolve(existing.session.cwd);
+              if (sameNative && sameCwd) {
+                existing.session = {
+                  ...existing.session,
+                  runtimeMode: input.runtimeMode,
+                  updatedAt: now,
+                };
+                if (input.modelSelection) existing.selection = input.modelSelection;
+                existing.runtime?.setRuntimeMode(input.runtimeMode);
+                return existing.session;
+              }
+              throw new Error("Automatic native restart/resume is disabled.");
+            }
+            if (input.resumeCursor) throw new Error("Automatic native restart/resume is disabled.");
+            if (!input.cwd) throw new Error("A workspace directory is required.");
             const catalog = requireCatalog();
             // Resolve once to validate the picker and to pin the native variant
             // for the live run. The persisted session keeps the picker family
@@ -227,7 +262,10 @@ export const DevinDriver: ProviderDriver<typeof DevinSettings.Type, ServerConfig
                 threadId: input.threadId,
                 runtimeMode: input.runtimeMode,
                 cwd: input.cwd,
-                model: input.modelSelection?.model ?? nativeModel,
+                model:
+                  input.modelSelection?.model ??
+                  familySlugForNativeId(catalog, nativeModel) ??
+                  nativeModel,
                 status: "ready",
                 createdAt: now,
                 updatedAt: now,
@@ -248,21 +286,40 @@ export const DevinDriver: ProviderDriver<typeof DevinSettings.Type, ServerConfig
               throw new Error(
                 "Native clear did not remove prior task memory in the live test. Clear is disabled until the patch is verified; the existing native prompt is retained.",
               );
-            if (
-              input.modelSelection &&
-              resolveDevinModel(state.catalog, input.modelSelection) !== state.nativeModel
-            )
-              throw new Error("Model changes require an explicitly new thread.");
+            // Fast path on the known catalog; selections unknown here defer to
+            // the refreshed check below instead of failing against stale data.
+            if (input.modelSelection) {
+              let fastNative: string | undefined;
+              try {
+                fastNative = resolveDevinModel(state.catalog, input.modelSelection);
+              } catch {
+                fastNative = undefined;
+              }
+              if (fastNative !== undefined && fastNative !== state.nativeModel)
+                throw new Error("Model changes require an explicitly new thread.");
+            }
             if (!state.runtime) {
               await Effect.runPromise(refresh);
               const freshCatalog = requireCatalog();
               // Re-resolve the original picker against the refreshed catalog so
               // the runtime keeps the pinned variant; fall back to validating
               // the stored native id when the thread started without a picker.
-              const nativeForRuntime = state.selection
-                ? resolveDevinModel(freshCatalog, state.selection)
-                : resolveDevinModel(freshCatalog, { model: state.nativeModel });
-              state.nativeModel = nativeForRuntime;
+              // A stored picker the fresh catalog no longer allows means the
+              // pinned model is gone, which also needs an explicitly new thread.
+              let pinnedNative: string;
+              try {
+                pinnedNative = state.selection
+                  ? resolveDevinModel(freshCatalog, state.selection)
+                  : resolveDevinModel(freshCatalog, { model: state.nativeModel });
+              } catch {
+                throw new Error("Model changes require an explicitly new thread.");
+              }
+              if (
+                input.modelSelection &&
+                resolveDevinModel(freshCatalog, input.modelSelection) !== pinnedNative
+              )
+                throw new Error("Model changes require an explicitly new thread.");
+              state.nativeModel = pinnedNative;
               state.catalog = freshCatalog;
               state.runtime = new DevinOpenTurn({
                 cwd: state.session.cwd!,
@@ -271,7 +328,7 @@ export const DevinDriver: ProviderDriver<typeof DevinSettings.Type, ServerConfig
                 providerInstanceId: instanceId,
                 host,
                 binary: config.binaryPath,
-                model: nativeForRuntime,
+                model: pinnedNative,
                 environment: mergeProviderInstanceEnvironment(environment),
                 compactionThresholdTokens: config.compactionThresholdTokens
                   ? Number(config.compactionThresholdTokens)

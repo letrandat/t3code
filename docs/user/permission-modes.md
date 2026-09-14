@@ -27,7 +27,8 @@ including OpenCode, Antigravity, and Devin, fall back to asking.
 For Grok, **Always allow this session** remembers the matching command or tool input. Other
 actions still require approval.
 
-Antigravity can still send native approval requests in **Full access**. It only offers remembered
-approvals for actions that support them.
+Antigravity and Devin can still send native approval requests in **Full access**. They only
+offer remembered approvals for actions that support them; anything without an offered allow
+option still asks.
 
 See the [provider guides](./install.md#providers) for setup and provider-specific limits.

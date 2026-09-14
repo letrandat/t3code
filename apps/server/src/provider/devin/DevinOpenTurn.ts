@@ -335,7 +335,9 @@ export class DevinOpenTurn {
                   jsonrpc: "2.0",
                   id: message.id,
                   result: {
-                    outcome: { outcome: "selected", optionId: autoOption.optionId.trim() },
+                    // Reply with the native option id verbatim: ids must
+                    // survive normalization, only the non-empty check trims.
+                    outcome: { outcome: "selected", optionId: autoOption.optionId },
                   },
                 }).catch((error: Error) => this.fail(error.message));
                 return;
@@ -482,6 +484,11 @@ export class DevinOpenTurn {
       request.options.find((option) => option.kind === "allow_always" && option.optionId.trim()) ??
       request.options.find((option) => option.kind === "allow_once" && option.optionId.trim())
     );
+  }
+  /** Sync the permission mode without touching the native run. The mode is
+      read per permission request, so switches apply to later requests live. */
+  setRuntimeMode(mode: RuntimeMode) {
+    this.options.runtimeMode = mode;
   }
   async respondToPermission(requestId: string, decision: ProviderApprovalDecision) {
     const pending = this.permissions.get(requestId);
