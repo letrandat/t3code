@@ -1,16 +1,24 @@
-import * as NodeTest from "node:test";
-import * as NodeAssert from "node:assert/strict";
+// @effect-diagnostics nodeBuiltinImport:off - the suite stages real config files in temp dirs.
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 import * as NodeOS from "node:os";
 import * as NodeCrypto from "node:crypto";
+import { afterEach, describe, expect, it } from "vite-plus/test";
 import { buildDevinConfig, verifyDevinBinary } from "./DevinLaunchConfig.ts";
 
-NodeTest.test(
-  "copy JSONC preferences, replace hooks, and leave originals and cwd alone",
-  async (t) => {
+const cleanups: Array<() => unknown> = [];
+afterEach(async () => {
+  let cleanup = cleanups.pop();
+  while (cleanup) {
+    await cleanup();
+    cleanup = cleanups.pop();
+  }
+});
+
+describe("devin launch config", () => {
+  it("copies JSONC preferences, replaces hooks, and leaves originals and cwd alone", async () => {
     const root = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "devin-config-"));
-    t.after(() => NodeFSP.rm(root, { recursive: true, force: true }));
+    cleanups.push(() => NodeFSP.rm(root, { recursive: true, force: true }));
     const configDir = NodePath.join(root, ".config", "devin");
     await NodeFSP.mkdir(configDir, { recursive: true });
     const source =
@@ -28,34 +36,28 @@ NodeTest.test(
       compactionThresholdTokens: 240000,
     };
     const config = await buildDevinConfig(options);
-    NodeAssert.equal(config.theme_mode, "dark");
-    NodeAssert.deepEqual(config.agent, {
+    expect(config.theme_mode).toBe("dark");
+    expect(config.agent).toEqual({
       model: "exact-model",
       compaction_threshold_tokens: 240000,
     });
-    NodeAssert.equal(config.auto_update, false);
-    NodeAssert.equal(config.subagents_enabled, false);
-    NodeAssert.doesNotMatch(JSON.stringify(config.hooks), /old/);
-    NodeAssert.match(JSON.stringify(config.hooks), /owned-hook/);
-    NodeAssert.equal(
-      await NodeFSP.readFile(NodePath.join(configDir, "config.json"), "utf8"),
-      source,
-    );
-    NodeAssert.equal(await NodeFSP.readFile(rule, "utf8"), "project rule");
+    expect(config.auto_update).toBe(false);
+    expect(config.subagents_enabled).toBe(false);
+    expect(JSON.stringify(config.hooks)).not.toMatch(/old/);
+    expect(JSON.stringify(config.hooks)).toMatch(/owned-hook/);
+    expect(await NodeFSP.readFile(NodePath.join(configDir, "config.json"), "utf8")).toBe(source);
+    expect(await NodeFSP.readFile(rule, "utf8")).toBe("project rule");
     await NodeFSP.mkdir(NodePath.join(project, ".devin"));
     await NodeFSP.writeFile(
       NodePath.join(project, ".devin", "config.local.json"),
       '{"hooks":{"Stop":[{}]}}',
     );
-    await NodeAssert.rejects(buildDevinConfig(options), /native hook takeover/);
-  },
-);
+    await expect(buildDevinConfig(options)).rejects.toThrow(/native hook takeover/);
+  });
 
-NodeTest.test(
-  "binary compatibility rejects a wrong ABI and changed bytes before launch",
-  async (t) => {
+  it("binary compatibility rejects a wrong ABI and changed bytes before launch", async () => {
     const dir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "devin-binary-"));
-    t.after(() => NodeFSP.rm(dir, { recursive: true, force: true }));
+    cleanups.push(() => NodeFSP.rm(dir, { recursive: true, force: true }));
     const binary = NodePath.join(dir, "devin");
     await NodeFSP.writeFile(binary, "pinned bytes");
     const manifest = {
@@ -68,17 +70,15 @@ NodeTest.test(
     await NodeFSP.writeFile(binary + ".manifest.json", JSON.stringify(manifest));
     await verifyDevinBinary(binary, { platform: "darwin", arch: "arm64" });
     await NodeFSP.writeFile(binary, "changed");
-    await NodeAssert.rejects(
-      verifyDevinBinary(binary, { platform: "darwin", arch: "arm64" }),
+    await expect(verifyDevinBinary(binary, { platform: "darwin", arch: "arm64" })).rejects.toThrow(
       /does not match/,
     );
     await NodeFSP.writeFile(
       binary + ".manifest.json",
       JSON.stringify({ ...manifest, control_abi: 99 }),
     );
-    await NodeAssert.rejects(
-      verifyDevinBinary(binary, { platform: "darwin", arch: "arm64" }),
+    await expect(verifyDevinBinary(binary, { platform: "darwin", arch: "arm64" })).rejects.toThrow(
       /ABI 1/,
     );
-  },
-);
+  });
+});

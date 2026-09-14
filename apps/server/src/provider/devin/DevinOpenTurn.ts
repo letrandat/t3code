@@ -1,11 +1,18 @@
+// @effect-diagnostics nodeBuiltinImport:off - Effect-free IPC client: raw sockets, process spawn, and file evidence by design.
+// @effect-diagnostics globalTimers:off - socket timeouts run on node timers; there is no Effect runtime in this class.
+// @effect-diagnostics globalDate:off - same: wall-clock deadlines without a Clock service.
 import { HostProcessPlatform, HostProcessArchitecture } from "@t3tools/shared/hostProcess";
-import { allowedDevinModels } from "./DevinModels.ts";
 import { buildDevinConfig, verifyDevinBinary } from "./DevinLaunchConfig.ts";
-import * as NodeReadline from "node:readline";
 import * as NodeNet from "node:net";
 import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
 import { hookSource } from "./hookSource.ts";
-import * as NodeOS from "node:os";
+import {
+  DEVIN_BOOTSTRAP_PROMPT,
+  HOST_WIRE_VERSION,
+  devinSocketPaths,
+  hostSource,
+} from "./hostSource.ts";
 import * as NodePath from "node:path";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeCrypto from "node:crypto";
@@ -37,42 +44,91 @@ export type DevinEvent =
   | { type: "waiting"; promptId: string; sessionId: string; cancelled: boolean }
   | { type: "cancel-requested" }
   | { type: "context"; mode: string; summary: string }
+  | {
+      type: "respawned";
+      generation: number;
+      sessionId?: string;
+      redelivered: boolean;
+      reason: string;
+    }
+  | { type: "host-lost" }
   | { type: "failed"; message: string };
+
+export type DevinRunSnapshot = {
+  runDir: string;
+  runId: string;
+  sessionId?: string | undefined;
+  promptId?: string | undefined;
+  generation?: number | undefined;
+  phase?: string | undefined;
+  stdoutIdleMs?: number | undefined;
+};
 
 type RecordValue = Record<string, unknown>;
 function record(value: unknown): RecordValue {
   return typeof value === "object" && value !== null ? (value as RecordValue) : {};
 }
 
-/** Owns a single native prompt. Visible turns finish when the Stop hook connects. */
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function pidAlive(pid: unknown): boolean {
+  if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function killBestEffort(pid: unknown, signal: NodeJS.Signals = "SIGTERM") {
+  if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) return;
+  try {
+    process.kill(pid, signal);
+  } catch {
+    /* Already exited. */
+  }
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    /* No group or already exited. */
+  }
+}
+
+/** Thin IPC client for one native run. The detached host owns the child, the
+    hook socket, and the run dir; this class never holds the child. Visible
+    turns finish when the Stop hook connects. */
 export class DevinOpenTurn {
-  private child?: NodeChildProcess.ChildProcessWithoutNullStreams;
-  private server?: NodeNet.Server;
-  private waiting: NodeNet.Socket | undefined;
-  private cancelRequested = false;
-  private phase: "new" | "bootstrapping" | "working" | "waiting" | "context" | "ended" = "new";
-  private firstTask: string | undefined;
-  private promptId?: string;
-  private sessionId?: string;
-  private maintenance: "compact" | undefined;
-  private pending = new Map<
+  private socket: NodeNet.Socket | undefined;
+  private buffer = "";
+  private sequence = 0;
+  private commands = new Map<
     number,
-    { resolve: (value: RecordValue) => void; reject: (e: Error) => void }
+    { resolve: (value: RecordValue) => void; reject: (error: Error) => void }
   >();
+  private byeWaiters = new Set<() => void>();
+  private phase: "new" | "live" | "ended" = "new";
+  /** Detach, close, and clean shutdown suppress the host-lost event. */
+  private deliberateEnd = false;
+  private snapshotState: {
+    sessionId?: string;
+    promptId?: string;
+    generation?: number;
+    phase?: string;
+    stdoutIdleMs?: number;
+  } = {};
   private permissions = new Map<
     string,
     {
-      id: string | number;
+      key: string;
       request: AcpSchema.RequestPermissionRequest;
       choices: Map<ProviderApprovalDecision, AcpSchema.PermissionOption>;
     }
   >();
-  private sequence = 0;
-  private promptSent = false;
-  readonly runId = NodeCrypto.randomUUID();
+  readonly runId: string;
+  private readonly runDir: string;
+  private readonly hostSock: string;
   private hookToken = NodeCrypto.randomBytes(32).toString("hex");
-  private state: string;
-  private socketPath = NodePath.join(NodeOS.tmpdir(), `t3-devin-${NodeCrypto.randomUUID()}.sock`);
   private options: {
     cwd: string;
     runRoot: string;
@@ -87,116 +143,288 @@ export class DevinOpenTurn {
     onEvent: (event: DevinEvent) => void;
     /** Test peers use an executable plus arguments; production uses the pinned binary. */
     args?: string[];
+    /** Attach to an existing run instead of spawning a host. */
+    attachTo?: { runDir: string; runId: string };
   };
   constructor(options: DevinOpenTurn["options"]) {
     this.options = options;
-    this.state = NodePath.join(options.runRoot, this.runId);
+    if (options.attachTo) {
+      this.runId = options.attachTo.runId;
+      this.runDir = options.attachTo.runDir;
+    } else {
+      this.runId = NodeCrypto.randomUUID();
+      this.runDir = NodePath.join(options.runRoot, this.runId);
+    }
+    this.hostSock = devinSocketPaths(this.runId).hostSock;
+  }
+
+  snapshot(): DevinRunSnapshot {
+    return {
+      runDir: this.runDir,
+      runId: this.runId,
+      ...(this.snapshotState.sessionId !== undefined
+        ? { sessionId: this.snapshotState.sessionId }
+        : {}),
+      ...(this.snapshotState.promptId !== undefined
+        ? { promptId: this.snapshotState.promptId }
+        : {}),
+      ...(this.snapshotState.generation !== undefined
+        ? { generation: this.snapshotState.generation }
+        : {}),
+      ...(this.snapshotState.phase !== undefined ? { phase: this.snapshotState.phase } : {}),
+      ...(this.snapshotState.stdoutIdleMs !== undefined
+        ? { stdoutIdleMs: this.snapshotState.stdoutIdleMs }
+        : {}),
+    };
   }
 
   private fail(message: string) {
+    if (this.phase === "ended") return;
     this.phase = "ended";
     this.clearPermissions();
-    for (const request of this.pending.values()) request.reject(new Error(message));
-    this.pending.clear();
+    for (const request of this.commands.values()) request.reject(new Error(message));
+    this.commands.clear();
     this.options.onEvent({ type: "failed", message });
   }
-  private async send(message: RecordValue) {
-    await NodeFSP.appendFile(
-      NodePath.join(this.state, "protocol.jsonl"),
-      JSON.stringify({ direction: "sent", message }) + "\n",
-    );
-    if (!this.child?.stdin.writable)
-      throw new Error("Native transport is unavailable. No replacement prompt will be sent.");
-    this.child.stdin.write(JSON.stringify(message) + "\n");
-  }
-  private rpc(method: string, params: RecordValue): Promise<RecordValue> {
-    const id = ++this.sequence;
-    return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      void this.send({ jsonrpc: "2.0", id, method, params }).catch((error: Error) => {
-        this.pending.delete(id);
-        reject(error);
-      });
-    });
-  }
-  private onHook(socket: NodeNet.Socket) {
-    const lines = NodeReadline.createInterface({ input: socket });
-    lines.once("line", (line) => {
+
+  private hostLost() {
+    if (this.phase === "ended" || this.deliberateEnd) return;
+    this.phase = "ended";
+    for (const request of this.commands.values())
+      request.reject(new Error("The native host is gone."));
+    this.commands.clear();
+    this.clearPermissions();
+    // Best effort: a dead host cannot reap its child group. Only touch pids
+    // the dead run named; never touch a live (e.g. wire-mismatched) host.
+    void (async () => {
       try {
-        const envelope = record(JSON.parse(line));
-        if (envelope.token !== this.hookToken) {
-          socket.destroy();
-          return;
-        }
-        const data = record(envelope.event);
-        if (this.phase === "ended") return;
-        if (
-          data.session_id !== this.sessionId ||
-          !data.prompt_id ||
-          (this.promptId && data.prompt_id !== this.promptId)
-        ) {
-          this.fail("Native hook identity does not match this run. No continuation sent.");
-          return;
-        }
-        void NodeFSP.appendFile(
-          NodePath.join(this.state, "hooks.jsonl"),
-          JSON.stringify(data) + "\n",
-        ).catch(() => this.fail("Hook evidence could not be saved."));
-        if (data.hook_event_name === "PreToolUse") {
-          const response = this.cancelRequested
-            ? {
-                decision: "block",
-                reason:
-                  "Task cancellation requested. Stop work, report partial results, and let the Stop hook wait.",
-              }
-            : {};
-          socket.end(JSON.stringify(response) + "\n");
-          return;
-        }
-        const promptId = String(data.prompt_id ?? "");
-        if (!promptId || (this.promptId && this.promptId !== promptId)) {
-          this.fail("Native prompt identity changed or is missing. Hook remains blocked.");
-          return;
-        }
-        this.promptId = promptId;
-        if (data.hook_event_name === "PostCompaction") {
-          const summary = String(data.summary ?? "");
-          this.options.onEvent({ type: "context", mode: this.maintenance ?? "automatic", summary });
-          this.maintenance = undefined;
-          socket.end("{}\n");
-          return;
-        }
-        if (data.hook_event_name !== "Stop") {
-          socket.end("{}\n");
-          return;
-        }
-        if (this.waiting) {
-          this.fail("Unexpected Stop hook; no continuation sent.");
-          return;
-        }
-        this.waiting = socket;
-        if (this.maintenance) {
-          this.fail("Stop arrived before context maintenance was confirmed.");
-          return;
-        }
-        this.phase = "waiting";
-        if (this.firstTask !== undefined) {
-          const text = this.firstTask;
-          this.firstTask = undefined;
-          void this.submit(text).catch((error: Error) => this.fail(error.message));
-          return;
-        }
+        const status = record(
+          JSON.parse(await NodeFSP.readFile(NodePath.join(this.runDir, "status.json"), "utf8")),
+        );
+        if (!pidAlive(status.hostPid)) killBestEffort(status.childPid, "SIGKILL");
+      } catch {
+        /* Evidence already gone. */
+      }
+    })();
+    this.options.onEvent({ type: "host-lost" });
+  }
+
+  private onLine(line: string) {
+    let message: RecordValue;
+    try {
+      message = record(JSON.parse(line));
+    } catch {
+      this.socket?.destroy();
+      return;
+    }
+    if (
+      (message.type === "ack" || message.type === "error" || message.type === "init") &&
+      typeof message.id === "number" &&
+      this.commands.has(message.id)
+    ) {
+      const request = this.commands.get(message.id)!;
+      this.commands.delete(message.id);
+      if (message.type === "error")
+        request.reject(new Error(String(message.message ?? "Host error.")));
+      else request.resolve(message);
+      return;
+    }
+    switch (message.type) {
+      case "text":
+        this.options.onEvent({ type: "text", text: String(message.text ?? "") });
+        break;
+      case "waiting": {
+        const promptId = String(message.promptId ?? "");
+        const sessionId = String(message.sessionId ?? "");
+        if (promptId) this.snapshotState.promptId = promptId;
+        if (sessionId) this.snapshotState.sessionId = sessionId;
+        this.snapshotState.phase = "waiting";
         this.options.onEvent({
           type: "waiting",
           promptId,
-          sessionId: String(data.session_id ?? this.sessionId),
-          cancelled: this.cancelRequested,
+          sessionId,
+          cancelled: message.cancelled === true,
         });
-      } catch {
-        this.fail("Malformed hook event; no continuation sent.");
+        break;
+      }
+      case "cancel-requested":
+        this.options.onEvent({ type: "cancel-requested" });
+        break;
+      case "permission": {
+        const key = String(message.key ?? "");
+        if (!key) break;
+        let request: AcpSchema.RequestPermissionRequest;
+        try {
+          request = decodePermissionRequest(message.request);
+        } catch {
+          this.fail("Malformed native permission request.");
+          return;
+        }
+        const autoOption = this.autoApprovedOption(request);
+        if (autoOption) {
+          // Never fail here: a stale key means the child already moved on
+          // (respawn clears host-side requests; the fresh child re-asks),
+          // and transport death is reported by the socket close handler.
+          void this.command("respond-permission", {
+            key,
+            result: { outcome: { outcome: "selected", optionId: autoOption.optionId } },
+          }).catch(() => {});
+          return;
+        }
+        const requestId = NodeCrypto.randomUUID();
+        const choices = new Map<ProviderApprovalDecision, AcpSchema.PermissionOption>();
+        for (const option of request.options) {
+          const decision =
+            option.kind === "allow_once"
+              ? "accept"
+              : option.kind === "allow_always"
+                ? "acceptAlways"
+                : option.kind === "reject_once"
+                  ? "decline"
+                  : undefined;
+          if (decision && option.optionId.trim() && !choices.has(decision))
+            choices.set(decision, option);
+        }
+        this.permissions.set(requestId, { key, request, choices });
+        this.options.onEvent({
+          type: "permission",
+          requestId,
+          request,
+          options: [
+            ...Array.from(choices, ([decision, option]) => ({
+              decision,
+              label: option.name.trim() || decision,
+            })),
+            { decision: "cancel", label: "Cancel" },
+          ],
+        });
+        break;
+      }
+      case "context":
+        this.options.onEvent({
+          type: "context",
+          mode: String(message.mode ?? "automatic"),
+          summary: String(message.summary ?? ""),
+        });
+        break;
+      case "respawned": {
+        if (typeof message.sessionId === "string") this.snapshotState.sessionId = message.sessionId;
+        if (typeof message.generation === "number")
+          this.snapshotState.generation = message.generation;
+        this.snapshotState.phase = "bootstrapping";
+        // The dead child's requests can never resolve; the fresh child re-asks.
+        this.clearPermissions();
+        this.options.onEvent({
+          type: "respawned",
+          generation: typeof message.generation === "number" ? message.generation : 0,
+          ...(typeof message.sessionId === "string" ? { sessionId: message.sessionId } : {}),
+          redelivered: message.redelivered === true,
+          reason: String(message.reason ?? ""),
+        });
+        break;
+      }
+      case "failed":
+        this.fail(String(message.message ?? "Native run failed."));
+        break;
+      case "bye":
+        for (const waiter of this.byeWaiters) waiter();
+        this.byeWaiters.clear();
+        break;
+      default:
+        break;
+    }
+  }
+
+  private command(type: string, extra: RecordValue = {}): Promise<RecordValue> {
+    if (!this.socket || this.socket.destroyed || this.phase !== "live")
+      return Promise.reject(new Error("The native run is no longer connected."));
+    return this.request(type, extra, 10000, "The native host did not answer.");
+  }
+
+  /** One correlated request over whatever socket is currently attached. Shared
+      by hello and every command so the ack/timeout shape stays identical. */
+  private request(
+    type: string,
+    extra: RecordValue,
+    timeoutMs: number,
+    timeoutMessage: string,
+  ): Promise<RecordValue> {
+    const socket = this.socket;
+    if (!socket || socket.destroyed)
+      return Promise.reject(new Error("The native run is no longer connected."));
+    const id = ++this.sequence;
+    return new Promise<RecordValue>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.commands.delete(id);
+        reject(new Error(timeoutMessage));
+      }, timeoutMs);
+      timer.unref?.();
+      this.commands.set(id, {
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      });
+      try {
+        socket.write(JSON.stringify({ type, id, ...extra }) + "\n");
+      } catch (error) {
+        this.commands.delete(id);
+        clearTimeout(timer);
+        reject(error instanceof Error ? error : new Error(String(error)));
       }
     });
   }
+
+  private async connectHello(timeoutMs: number): Promise<RecordValue> {
+    const deadline = Date.now() + timeoutMs;
+    let lastError: unknown = new Error("unreachable");
+    while (Date.now() < deadline) {
+      try {
+        const socket = await new Promise<NodeNet.Socket>((resolve, reject) => {
+          const attempt = NodeNet.connect(this.hostSock);
+          attempt.once("connect", () => resolve(attempt));
+          attempt.once("error", reject);
+        });
+        this.socket = socket;
+        socket.on("data", (chunk: Buffer) => {
+          this.buffer += chunk.toString("utf8");
+          const lines = this.buffer.split("\n");
+          this.buffer = lines.pop() ?? "";
+          for (const line of lines) {
+            if (line.trim()) this.onLine(line);
+          }
+        });
+        socket.on("error", () => socket.destroy());
+        socket.on("close", () => {
+          if (this.socket === socket) this.socket = undefined;
+          this.hostLost();
+        });
+        return await this.request(
+          "hello",
+          { wire: HOST_WIRE_VERSION, pid: process.pid, runId: this.runId },
+          10000,
+          "The native host did not answer hello.",
+        );
+      } catch (error) {
+        lastError = error;
+        this.socket?.destroy();
+        this.socket = undefined;
+        await sleep(150);
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  }
+
+  /** Command-path liveness probe. The hello handshake already proves the
+      socket is up; this proves the dispatch path a submit will use. */
+  async ping(): Promise<void> {
+    await this.command("ping");
+  }
+
   async start() {
     if (
       this.options.compactionThresholdTokens !== undefined &&
@@ -205,36 +433,35 @@ export class DevinOpenTurn {
     )
       throw new Error("Compaction threshold must be a positive whole number.");
     if (this.phase !== "new") throw new Error("This native run cannot be restarted.");
-    if (!this.options.args)
-      await verifyDevinBinary(
-        this.options.binary,
-        this.options.host ?? {
-          platform: HostProcessPlatform.defaultValue(),
-          arch: HostProcessArchitecture.defaultValue(),
-        },
-      );
+    // Pin the exact verified bytes: a respawn after an in-place binary swap
+    // must fail loudly instead of silently mixing versions. Test peers skip
+    // verification and pin nothing.
+    const binarySha256 = this.options.args
+      ? undefined
+      : await verifyDevinBinary(
+          this.options.binary,
+          this.options.host ?? {
+            platform: HostProcessPlatform.defaultValue(),
+            arch: HostProcessArchitecture.defaultValue(),
+          },
+        );
     // Never share control state or infer run identity from the project directory.
     if (!NodePath.isAbsolute(this.options.runRoot))
       throw new Error("Devin run root must be absolute.");
     await NodeFSP.mkdir(this.options.runRoot, { recursive: true, mode: 0o700 });
-    await NodeFSP.mkdir(this.state, { mode: 0o700 });
-    this.server = NodeNet.createServer((socket) => this.onHook(socket));
-    await new Promise<void>((resolve, reject) => {
-      this.server!.once("error", reject);
-      this.server!.listen(this.socketPath, resolve);
-    });
-    await NodeFSP.chmod(this.socketPath, 0o600);
+    await NodeFSP.mkdir(this.runDir, { mode: 0o700 });
     const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+    const { hookSock, hostSock } = devinSocketPaths(this.runId);
     const command = [
       process.execPath,
-      NodePath.join(this.state, "hook.mjs"),
-      this.socketPath,
+      NodePath.join(this.runDir, "hook.mjs"),
+      hookSock,
       this.hookToken,
     ]
       .map(quote)
       .join(" ");
-    await NodeFSP.writeFile(NodePath.join(this.state, "hook.mjs"), hookSource, { mode: 0o600 });
-    const configPath = NodePath.join(this.state, "config.json");
+    await NodeFSP.writeFile(NodePath.join(this.runDir, "hook.mjs"), hookSource, { mode: 0o600 });
+    const configPath = NodePath.join(this.runDir, "config.json");
     await NodeFSP.writeFile(
       configPath,
       JSON.stringify(
@@ -248,231 +475,173 @@ export class DevinOpenTurn {
       ),
       { mode: 0o600 },
     );
-    const launchEnvironment = { ...(this.options.environment ?? process.env) };
-    for (const key of Object.keys(launchEnvironment)) {
-      if (key.startsWith("DEVIN_CONTROL_")) delete launchEnvironment[key];
-    }
-    Object.assign(launchEnvironment, {
-      DEVIN_CONTROL_DIR: this.state,
-      DEVIN_CONTROL_RUN_ID: this.runId,
-      DEVIN_CONTROL_ABI: "1",
-    });
-    // exec preserves the shell PID; inherited child settings retain that owner's PID.
-    this.child = NodeChildProcess.spawn(
-      "/bin/sh",
-      [
-        "-c",
-        'export DEVIN_CONTROL_OWNER_PID=$$; exec "$@"',
-        "t3-devin",
-        this.options.binary,
-        ...(this.options.args ?? []),
-        "--config",
-        configPath,
-        "acp",
-        "--model",
-        this.options.model,
-      ],
+    await NodeFSP.writeFile(NodePath.join(this.runDir, "host.mjs"), hostSource, { mode: 0o600 });
+    await NodeFSP.writeFile(
+      NodePath.join(this.runDir, "sockets.json"),
+      JSON.stringify({ hookSock, hostSock }),
       {
-        cwd: this.options.cwd,
-        detached: true,
-        env: launchEnvironment,
-        stdio: "pipe",
+        mode: 0o600,
       },
     );
-    this.child.on("error", (error) => this.fail(error.message));
-    this.child.on("exit", () => this.fail("Native process ended. No replacement prompt was sent."));
-    this.child.stderr.on("data", (data: Buffer) => {
-      void NodeFSP.appendFile(NodePath.join(this.state, "stderr.log"), data).catch(() => {});
-    });
-    NodeReadline.createInterface({ input: this.child.stdout }).on("line", (line) => {
+    await NodeFSP.writeFile(
+      NodePath.join(this.runDir, "launch.json"),
+      JSON.stringify({
+        wire: HOST_WIRE_VERSION,
+        runId: this.runId,
+        threadId: this.options.threadId,
+        providerInstanceId: this.options.providerInstanceId,
+        cwd: this.options.cwd,
+        binary: this.options.binary,
+        ...(this.options.args ? { args: this.options.args } : {}),
+        ...(binarySha256 ? { binarySha256 } : {}),
+        model: this.options.model,
+        configPath,
+        hookToken: this.hookToken,
+        hookSock,
+        hostSock,
+        env: this.options.environment ?? process.env,
+        bootstrap: DEVIN_BOOTSTRAP_PROMPT,
+      }),
+      { mode: 0o600 },
+    );
+    // Detached: server shutdown or crash never signals this group. stdio is
+    // ignored so the host never holds the server's pipes open.
+    const spawned = NodeChildProcess.spawn(
+      process.execPath,
+      [NodePath.join(this.runDir, "host.mjs"), this.runDir],
+      { detached: true, stdio: "ignore" },
+    );
+    spawned.unref();
+    try {
+      const init = await this.connectHello(15000);
+      this.applyInit(record(init.status));
+    } catch (cause) {
+      // A host we just spawned that never answers is broken, not stale: reap
+      // it (its SIGTERM handler stops its child group) instead of orphaning.
+      if (spawned.pid) killBestEffort(spawned.pid, "SIGTERM");
+      this.socket?.destroy();
+      this.socket = undefined;
+      let evidence = "";
       try {
-        const message = record(JSON.parse(line));
-        void NodeFSP.appendFile(
-          NodePath.join(this.state, "protocol.jsonl"),
-          JSON.stringify({ direction: "received", message }) + "\n",
-        ).catch(() => this.fail("Protocol evidence could not be saved."));
-        if (typeof message.id === "number" && this.pending.has(message.id) && !message.method) {
-          const request = this.pending.get(message.id)!;
-          this.pending.delete(message.id);
-          if (message.error) request.reject(new Error(JSON.stringify(message.error)));
-          else request.resolve(record(message.result));
-        } else if (message.method === "session/update") {
-          const params = record(message.params);
-          // Devin sends config updates before session/new returns its identity.
-          if (!this.sessionId) return;
-          if (params.sessionId !== this.sessionId) {
-            this.fail("Native update identity does not match this run.");
-            return;
-          }
-          const update = record(params.update);
-          const content = record(update.content);
-          if (
-            update.sessionUpdate === "agent_message_chunk" &&
-            content.type === "text" &&
-            this.phase === "working"
-          ) {
-            this.options.onEvent({ type: "text", text: String(content.text ?? "") });
-          }
-        } else if (message.method && message.id !== undefined) {
-          if (message.method === "session/request_permission") {
-            const request = decodePermissionRequest(message.params);
-            if (typeof message.id !== "string" && typeof message.id !== "number")
-              throw new Error("Invalid permission request ID.");
-            if (
-              request.sessionId !== this.sessionId ||
-              this.cancelRequested ||
-              this.phase === "ended"
-            ) {
-              void this.send({
-                jsonrpc: "2.0",
-                id: message.id,
-                result: { outcome: { outcome: "cancelled" } },
-              }).catch((error: Error) => this.fail(error.message));
-            } else {
-              const autoOption = this.autoApprovedOption(request);
-              if (autoOption) {
-                void this.send({
-                  jsonrpc: "2.0",
-                  id: message.id,
-                  result: {
-                    // Reply with the native option id verbatim: ids must
-                    // survive normalization, only the non-empty check trims.
-                    outcome: { outcome: "selected", optionId: autoOption.optionId },
-                  },
-                }).catch((error: Error) => this.fail(error.message));
-                return;
-              }
-              const requestId = NodeCrypto.randomUUID();
-              const choices = new Map<ProviderApprovalDecision, AcpSchema.PermissionOption>();
-              for (const option of request.options) {
-                const decision =
-                  option.kind === "allow_once"
-                    ? "accept"
-                    : option.kind === "allow_always"
-                      ? "acceptAlways"
-                      : option.kind === "reject_once"
-                        ? "decline"
-                        : undefined;
-                if (decision && option.optionId.trim() && !choices.has(decision))
-                  choices.set(decision, option);
-              }
-              this.permissions.set(requestId, { id: message.id, request, choices });
-              this.options.onEvent({
-                type: "permission",
-                requestId,
-                request,
-                options: [
-                  ...Array.from(choices, ([decision, option]) => ({
-                    decision,
-                    label: option.name.trim() || decision,
-                  })),
-                  { decision: "cancel", label: "Cancel" },
-                ],
-              });
-            }
-          } else {
-            void this.send({
-              jsonrpc: "2.0",
-              id: message.id,
-              error: { code: -32601, message: "Unsupported client request" },
-            }).catch((error: Error) => this.fail(error.message));
-          }
-        }
+        const log = await NodeFSP.readFile(NodePath.join(this.runDir, "host.log"), "utf8");
+        if (log.trim()) evidence = ` Host log: ${log.slice(-500)}`;
       } catch {
-        this.fail("Malformed native ACP message.");
+        /* No log; the cause below is the evidence. */
       }
-    });
-    await NodeFSP.writeFile(
-      NodePath.join(this.state, "identity.json"),
-      JSON.stringify({
-        runId: this.runId,
-        threadId: this.options.threadId,
-        providerInstanceId: this.options.providerInstanceId,
-        cwd: this.options.cwd,
-        pid: this.child.pid,
-        status: "starting",
-      }),
-      { mode: 0o600 },
-    );
-    await this.rpc("initialize", {
-      protocolVersion: 1,
-      clientCapabilities: {},
-      clientInfo: { name: "t3-devin", version: "0.1" },
-    });
-    const session = await this.rpc("session/new", { cwd: this.options.cwd, mcpServers: [] });
-    const model =
-      (Array.isArray(session.configOptions) ? session.configOptions : [])
-        .map(record)
-        .find((option) => option.id === "model")?.currentValue ??
-      record(session.models).currentModelId;
-    if (!allowedDevinModels(session).ids.has(this.options.model))
       throw new Error(
-        "Selected Devin model is no longer allowed; no prompt sent. Retry discovery.",
+        `Native host did not come up: ${cause instanceof Error ? cause.message : String(cause)}${evidence}`,
+        { cause },
       );
-    if (model !== this.options.model)
-      throw new Error(
-        `Selected model ${String(model)} differs from ${this.options.model}; no prompt sent.`,
-      );
-    if (typeof session.sessionId !== "string") throw new Error("ACP did not return a session ID.");
-    this.sessionId = session.sessionId;
-    await NodeFSP.writeFile(
-      NodePath.join(this.state, "identity.json"),
-      JSON.stringify({
-        runId: this.runId,
-        threadId: this.options.threadId,
-        providerInstanceId: this.options.providerInstanceId,
-        cwd: this.options.cwd,
-        pid: this.child.pid,
-        sessionId: this.sessionId,
-        status: "connected",
-      }),
-      { mode: 0o600 },
-    );
+    }
+    this.phase = "live";
   }
+
+  private applyInit(status: RecordValue) {
+    if (typeof status.sessionId === "string") this.snapshotState.sessionId = status.sessionId;
+    if (typeof status.promptId === "string") this.snapshotState.promptId = status.promptId;
+    if (typeof status.generation === "number") this.snapshotState.generation = status.generation;
+    if (typeof status.phase === "string") this.snapshotState.phase = status.phase;
+    if (typeof status.stdoutIdleMs === "number")
+      this.snapshotState.stdoutIdleMs = status.stdoutIdleMs;
+  }
+
+  /** Attach to a run a previous server detached from. Never spawns, never
+      prompts, never kills: failures report and leave the run untouched. */
+  static async attach(
+    options: DevinOpenTurn["options"] & { attachTo: { runDir: string; runId: string } },
+  ) {
+    const runDir = NodePath.resolve(options.attachTo.runDir);
+    const runRoot = NodePath.resolve(options.runRoot);
+    if (!runDir.startsWith(runRoot + NodePath.sep))
+      throw new Error("Cannot reattach: the run directory is outside the Devin run root.");
+    if (NodePath.basename(runDir) !== options.attachTo.runId)
+      throw new Error("Cannot reattach: the run directory does not match its run id.");
+    const readJson = async (name: string) =>
+      record(JSON.parse(await NodeFSP.readFile(NodePath.join(runDir, name), "utf8")));
+    let shutdown = false;
+    try {
+      await NodeFSP.access(NodePath.join(runDir, "shutdown.request"));
+      shutdown = true;
+    } catch {
+      /* No marker. */
+    }
+    if (shutdown)
+      throw new Error(
+        "Cannot reattach: this native run was shut down deliberately. Start a new thread for a fresh run.",
+      );
+    let status: RecordValue;
+    try {
+      status = await readJson("status.json");
+    } catch {
+      throw new Error(
+        "Cannot reattach: the native run has no status. No replacement prompt was sent.",
+      );
+    }
+    if (status.runId !== options.attachTo.runId)
+      throw new Error(
+        "Cannot reattach: run status does not match this run. No replacement prompt was sent.",
+      );
+    if (status.wire !== HOST_WIRE_VERSION)
+      throw new Error(
+        `Cannot reattach: host wire ${String(status.wire)} does not match driver wire ${HOST_WIRE_VERSION}. ` +
+          "The run was left untouched; finish or stop the thread from a matching T3.",
+      );
+    if (status.status === "ended" || status.status === "failed") {
+      const lastExit = record(status.lastExit);
+      const detail =
+        (typeof lastExit.reason === "string" && lastExit.reason) ||
+        (typeof lastExit.stderrTail === "string" && lastExit.stderrTail.slice(-300)) ||
+        `code=${String(lastExit.code)} signal=${String(lastExit.signal)}`;
+      throw new Error(
+        `Cannot reattach: the native run ${status.status === "ended" ? "ended" : "failed"}${detail ? ` (${detail})` : ""}. No replacement prompt was sent.`,
+      );
+    }
+    let claim: RecordValue;
+    try {
+      claim = await readJson("host.claim");
+    } catch {
+      throw new Error(
+        "Cannot reattach: the native run was never claimed by a host. No replacement prompt was sent.",
+      );
+    }
+    if (claim.runId !== options.attachTo.runId || claim.wire !== HOST_WIRE_VERSION)
+      throw new Error(
+        "Cannot reattach: host claim does not match this run. No replacement prompt was sent.",
+      );
+    if (!pidAlive(claim.hostPid))
+      throw new Error(
+        "Cannot reattach: the native host process is gone. No replacement prompt was sent.",
+      );
+    const runtime = new DevinOpenTurn(options);
+    try {
+      const init = await runtime.connectHello(10000);
+      const live = record(init.status);
+      if (live.runId !== options.attachTo.runId)
+        throw new Error("Host answered for a different run.");
+      runtime.applyInit(live);
+    } catch (cause) {
+      runtime.socket?.destroy();
+      runtime.socket = undefined;
+      throw new Error(
+        `Cannot reattach to the native run: ${cause instanceof Error ? cause.message : String(cause)} The run was left untouched; no replacement prompt was sent.`,
+        { cause },
+      );
+    }
+    runtime.phase = "live";
+    return runtime;
+  }
+
   async submit(text: string) {
     if (!text.trim()) throw new Error("Message is empty.");
-    if (!this.sessionId || !["new", "waiting"].includes(this.phase))
-      throw new Error("Devin is busy or its native turn ended.");
-    this.cancelRequested = false;
-    if (!this.promptSent) {
-      this.promptSent = true;
-      this.firstTask = text;
-      this.phase = "bootstrapping";
-      void this.rpc("session/prompt", {
-        sessionId: this.sessionId,
-        prompt: [
-          {
-            type: "text",
-            text: "Reply READY and let the Stop hook wait. Tasks arrive through that hook. Complete each task, then let the Stop hook wait again. Never start another prompt or poll for work.",
-          },
-        ],
-      }).then(
-        () => this.fail("Original native prompt completed. No replacement was sent."),
-        (error: Error) => this.fail(error.message),
-      );
-    } else {
-      if (!this.waiting) throw new Error("The Stop hook is not waiting.");
-      this.phase = "working";
-      this.waiting.end(JSON.stringify({ decision: "block", reason: text }) + "\n");
-      this.waiting = undefined;
-    }
+    if (this.phase !== "live") throw new Error("Devin is busy or its native turn ended.");
+    await this.command("submit", { text });
   }
+
   async context(mode: "compact") {
-    if (this.phase !== "waiting" || !this.waiting)
-      throw new Error("Context actions require the waiting Stop hook.");
-    this.cancelRequested = false;
-    await NodeFSP.writeFile(NodePath.join(this.state, "compact.request"), "");
-    this.maintenance = mode;
-    this.phase = "context";
-    this.waiting.end(
-      JSON.stringify({
-        decision: "block",
-        reason:
-          "Perform pending context maintenance, then reply READY and let the Stop hook wait. Do not begin a task.",
-      }) + "\n",
-    );
-    this.waiting = undefined;
+    if (this.phase !== "live") throw new Error("Context actions require the waiting Stop hook.");
+    await this.command("context", { mode });
   }
+
   private autoApprovedOption(request: AcpSchema.RequestPermissionRequest) {
     const mode = this.options.runtimeMode;
     if (mode !== "full-access" && mode !== "auto-accept-edits") return undefined;
@@ -485,11 +654,13 @@ export class DevinOpenTurn {
       request.options.find((option) => option.kind === "allow_once" && option.optionId.trim())
     );
   }
+
   /** Sync the permission mode without touching the native run. The mode is
       read per permission request, so switches apply to later requests live. */
   setRuntimeMode(mode: RuntimeMode) {
     this.options.runtimeMode = mode;
   }
+
   async respondToPermission(requestId: string, decision: ProviderApprovalDecision) {
     const pending = this.permissions.get(requestId);
     if (!pending) throw new Error("This approval request is no longer pending.");
@@ -498,9 +669,8 @@ export class DevinOpenTurn {
       throw new Error("Devin did not offer this permission choice.");
     this.permissions.delete(requestId);
     try {
-      await this.send({
-        jsonrpc: "2.0",
-        id: pending.id,
+      await this.command("respond-permission", {
+        key: pending.key,
         result: {
           outcome: option
             ? { outcome: "selected", optionId: option.optionId }
@@ -514,7 +684,15 @@ export class DevinOpenTurn {
         request: pending.request,
         decision: "cancel",
       });
-      this.fail(error instanceof Error ? error.message : String(error));
+      // A rejected response never kills the run: the request is already gone
+      // (stale key after a respawn or cancel) or the transport is dead, which
+      // the socket close handler reports as host-lost on its own.
+      const message = error instanceof Error ? error.message : String(error);
+      if (
+        message === "The native run is no longer connected." ||
+        message === "The native host is gone."
+      )
+        this.hostLost();
       throw error;
     }
     this.options.onEvent({
@@ -524,6 +702,7 @@ export class DevinOpenTurn {
       decision,
     });
   }
+
   private clearPermissions() {
     for (const [requestId, pending] of this.permissions) {
       this.options.onEvent({
@@ -535,27 +714,103 @@ export class DevinOpenTurn {
     }
     this.permissions.clear();
   }
+
   softCancel() {
-    if (!["working", "bootstrapping"].includes(this.phase) || this.cancelRequested) return;
-    this.cancelRequested = true;
-    for (const requestId of this.permissions.keys()) {
-      void this.respondToPermission(requestId, "cancel").catch(() => {});
-    }
-    if (this.phase === "bootstrapping") this.firstTask = undefined;
-    this.options.onEvent({ type: "cancel-requested" });
-  }
-  close() {
-    this.phase = "ended";
+    if (this.phase !== "live") return;
+    // Resolve the UI side first: every open approval is dead whatever the
+    // host does. The host gates the native side: a cancel that lands while
+    // idle answers ack without inventing a cancellation event.
     this.clearPermissions();
-    if (this.child?.pid) {
-      // This process group was created by this instance; includes its waiting hook.
+    void this.command("cancel").catch(() => {});
+  }
+
+  /** This process attached last: no other server has adopted the run since. */
+  private async lastClaimantIsSelf(): Promise<boolean> {
+    try {
+      const claim = record(
+        JSON.parse(await NodeFSP.readFile(NodePath.join(this.runDir, "host.claim"), "utf8")),
+      );
+      return claim.clientPid === process.pid;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Deliberate shutdown: stop the host and its child group, mark the run.
+      Reconnects first when this instance detached or the socket dropped, but
+      only while this process is still the run's last claimant: a run another
+      server adopted is not ours to kill. */
+  async close() {
+    if (this.phase === "ended" && !this.socket && !(await this.lastClaimantIsSelf())) return;
+    this.deliberateEnd = true;
+    this.clearPermissions();
+    if ((!this.socket || this.socket.destroyed) && !(await this.lastClaimantIsSelf())) {
+      this.phase = "ended";
+      this.socket?.destroy();
+      this.socket = undefined;
+      return;
+    }
+    if (!this.socket || this.socket.destroyed) {
       try {
-        process.kill(-this.child.pid, "SIGTERM");
+        await this.connectHello(5000);
+        // Reconnected only to shut down; allow the shutdown command through.
+        this.phase = "live";
       } catch {
-        /* Already exited. */
+        /* Fall through to the file fallback below. */
       }
     }
-    this.waiting?.destroy();
-    this.server?.close();
+    try {
+      if (!this.socket || this.socket.destroyed) throw new Error("no connection");
+      await this.command("shutdown");
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("no bye")), 10000);
+        timer.unref?.();
+        this.byeWaiters.add(() => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+    } catch {
+      // Host unreachable or refusing: the marker below still records intent,
+      // and the group kill reaps what the host cannot.
+      try {
+        const status = record(
+          JSON.parse(NodeFS.readFileSync(NodePath.join(this.runDir, "status.json"), "utf8")),
+        );
+        killBestEffort(status.childPid, "SIGTERM");
+        killBestEffort(status.hostPid, "SIGTERM");
+        await sleep(2000);
+        killBestEffort(status.childPid, "SIGKILL");
+        killBestEffort(status.hostPid, "SIGKILL");
+      } catch {
+        /* Evidence already gone. */
+      }
+      try {
+        await NodeFSP.writeFile(
+          NodePath.join(this.runDir, "shutdown.request"),
+          JSON.stringify({ at: new Date().toISOString(), by: "driver" }),
+          { mode: 0o600 },
+        );
+      } catch {
+        /* Run dir already gone. */
+      }
+    } finally {
+      this.phase = "ended";
+      this.socket?.destroy();
+      this.socket = undefined;
+    }
+  }
+
+  /** Drop the IPC connection and leave the host and child alive. The next
+      server re-attaches by run directory; nothing here may kill or prompt. */
+  detach() {
+    this.deliberateEnd = true;
+    this.phase = "ended";
+    for (const request of this.commands.values())
+      request.reject(new Error("Detached from the native run."));
+    this.commands.clear();
+    this.permissions.clear();
+    this.socket?.destroy();
+    this.socket = undefined;
   }
 }
