@@ -26,6 +26,8 @@
  * enforced by a test, not by inspection.
  */
 export const CLI_RUNTIME_EXTERNAL_PREFIXES = [
+  // Its UMD wrapper leaves relative require calls unresolved when bundled.
+  "jsonc-parser",
   "node-pty",
   "ffi-rs",
   "@yuuang/",
