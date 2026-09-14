@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off - leaf module: reads machine/project config files, no Effect runtime.
 import * as NodeFSP from "node:fs/promises";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
@@ -22,11 +23,12 @@ async function readConfig(path: string): Promise<JsonObject> {
   return value as JsonObject;
 }
 
-/** A sidecar is a compatibility claim tied to exact bytes, not a trust signature. */
+/** A sidecar is a compatibility claim tied to exact bytes, not a trust signature.
+    Returns the verified digest so the run pins the exact bytes it started with. */
 export async function verifyDevinBinary(
   binary: string,
   host: { platform: NodeJS.Platform; arch: NodeJS.Architecture },
-) {
+): Promise<string> {
   if (host.platform !== "darwin" || host.arch !== "arm64") {
     throw new Error("The private-control Devin patch currently requires macOS ARM64.");
   }
@@ -45,9 +47,11 @@ export async function verifyDevinBinary(
   }
   const hash = NodeCrypto.createHash("sha256");
   for await (const chunk of NodeFS.createReadStream(binary)) hash.update(chunk);
-  if (hash.digest("hex") !== manifest.output_sha256) {
+  const digest = hash.digest("hex");
+  if (digest !== manifest.output_sha256) {
     throw new Error("Devin binary does not match its compatibility manifest. No prompt sent.");
   }
+  return digest;
 }
 
 export async function buildDevinConfig(options: {
