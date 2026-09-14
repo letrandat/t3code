@@ -12,7 +12,11 @@ import * as NodeCrypto from "node:crypto";
 
 import * as Schema from "effect/Schema";
 import * as AcpSchema from "effect-acp/schema";
-import type { ProviderApprovalDecision, ProviderApprovalOption } from "@t3tools/contracts";
+import type {
+  ProviderApprovalDecision,
+  ProviderApprovalOption,
+  RuntimeMode,
+} from "@t3tools/contracts";
 
 const decodePermissionRequest = Schema.decodeUnknownSync(AcpSchema.RequestPermissionRequest);
 
@@ -79,6 +83,7 @@ export class DevinOpenTurn {
     model: string;
     environment?: NodeJS.ProcessEnv;
     compactionThresholdTokens?: number | undefined;
+    runtimeMode?: RuntimeMode;
     onEvent: (event: DevinEvent) => void;
     /** Test peers use an executable plus arguments; production uses the pinned binary. */
     args?: string[];
@@ -324,6 +329,17 @@ export class DevinOpenTurn {
                 result: { outcome: { outcome: "cancelled" } },
               }).catch((error: Error) => this.fail(error.message));
             } else {
+              const autoOption = this.autoApprovedOption(request);
+              if (autoOption) {
+                void this.send({
+                  jsonrpc: "2.0",
+                  id: message.id,
+                  result: {
+                    outcome: { outcome: "selected", optionId: autoOption.optionId.trim() },
+                  },
+                }).catch((error: Error) => this.fail(error.message));
+                return;
+              }
               const requestId = NodeCrypto.randomUUID();
               const choices = new Map<ProviderApprovalDecision, AcpSchema.PermissionOption>();
               for (const option of request.options) {
@@ -454,6 +470,18 @@ export class DevinOpenTurn {
       }) + "\n",
     );
     this.waiting = undefined;
+  }
+  private autoApprovedOption(request: AcpSchema.RequestPermissionRequest) {
+    const mode = this.options.runtimeMode;
+    if (mode !== "full-access" && mode !== "auto-accept-edits") return undefined;
+    if (mode === "auto-accept-edits") {
+      const kind = request.toolCall.kind;
+      if (kind !== "edit" && kind !== "delete" && kind !== "move") return undefined;
+    }
+    return (
+      request.options.find((option) => option.kind === "allow_always" && option.optionId.trim()) ??
+      request.options.find((option) => option.kind === "allow_once" && option.optionId.trim())
+    );
   }
   async respondToPermission(requestId: string, decision: ProviderApprovalDecision) {
     const pending = this.permissions.get(requestId);

@@ -7,6 +7,7 @@ import * as NodeCrypto from "node:crypto";
 import {
   DevinSettings,
   EventId,
+  type ModelSelection,
   RuntimeRequestId,
   ProviderDriverKind,
   TurnId,
@@ -46,6 +47,10 @@ type State = {
   active?: TurnId | undefined;
   text: string;
   catalog: DevinModelCatalog;
+  /** Resolved native variant id for the live run (e.g. `grok-4-high`). */
+  nativeModel: string;
+  /** Original picker selection (family slug + options) for variant-aware checks. */
+  selection?: ModelSelection | undefined;
 };
 
 export const DevinDriver: ProviderDriver<typeof DevinSettings.Type, ServerConfig> = {
@@ -204,16 +209,25 @@ export const DevinDriver: ProviderDriver<typeof DevinSettings.Type, ServerConfig
               throw new Error("Automatic native restart/resume is disabled.");
             if (!input.cwd) throw new Error("A workspace directory is required.");
             const now = new Date().toISOString();
+            const catalog = requireCatalog();
+            // Resolve once to validate the picker and to pin the native variant
+            // for the live run. The persisted session keeps the picker family
+            // slug so the orchestration model lock (which compares picker vs
+            // picker) does not mistake `grok-4` + high for a switch to
+            // `grok-4-high` on the next turn after a soft stop.
+            const nativeModel = resolveDevinModel(catalog, input.modelSelection);
             const state: State = {
               text: "",
-              catalog: requireCatalog(),
+              catalog,
+              nativeModel,
+              ...(input.modelSelection ? { selection: input.modelSelection } : {}),
               session: {
                 provider,
                 providerInstanceId: instanceId,
                 threadId: input.threadId,
                 runtimeMode: input.runtimeMode,
                 cwd: input.cwd,
-                model: resolveDevinModel(requireCatalog(), input.modelSelection),
+                model: input.modelSelection?.model ?? nativeModel,
                 status: "ready",
                 createdAt: now,
                 updatedAt: now,
@@ -236,12 +250,20 @@ export const DevinDriver: ProviderDriver<typeof DevinSettings.Type, ServerConfig
               );
             if (
               input.modelSelection &&
-              resolveDevinModel(state.catalog, input.modelSelection) !== state.session.model
+              resolveDevinModel(state.catalog, input.modelSelection) !== state.nativeModel
             )
               throw new Error("Model changes require an explicitly new thread.");
             if (!state.runtime) {
               await Effect.runPromise(refresh);
-              resolveDevinModel(requireCatalog(), { model: state.session.model! });
+              const freshCatalog = requireCatalog();
+              // Re-resolve the original picker against the refreshed catalog so
+              // the runtime keeps the pinned variant; fall back to validating
+              // the stored native id when the thread started without a picker.
+              const nativeForRuntime = state.selection
+                ? resolveDevinModel(freshCatalog, state.selection)
+                : resolveDevinModel(freshCatalog, { model: state.nativeModel });
+              state.nativeModel = nativeForRuntime;
+              state.catalog = freshCatalog;
               state.runtime = new DevinOpenTurn({
                 cwd: state.session.cwd!,
                 runRoot: NodePath.join(serverConfig.stateDir, "providers", "devin", "runs"),
@@ -249,11 +271,12 @@ export const DevinDriver: ProviderDriver<typeof DevinSettings.Type, ServerConfig
                 providerInstanceId: instanceId,
                 host,
                 binary: config.binaryPath,
-                model: state.session.model!,
+                model: nativeForRuntime,
                 environment: mergeProviderInstanceEnvironment(environment),
                 compactionThresholdTokens: config.compactionThresholdTokens
                   ? Number(config.compactionThresholdTokens)
                   : undefined,
+                runtimeMode: state.session.runtimeMode,
                 onEvent: (event) => onEvent(state, event),
               });
               try {

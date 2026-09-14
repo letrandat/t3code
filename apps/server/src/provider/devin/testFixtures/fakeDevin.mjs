@@ -88,9 +88,9 @@ const permission = (text) =>
           : `session-${process.env.DEVIN_CONTROL_RUN_ID}`,
         toolCall: {
           toolCallId: "exec-1",
-          kind: "execute",
-          title: "Run command",
-          rawInput: { command: "echo approved" },
+          kind: text.includes("EDIT") ? "edit" : "execute",
+          title: text.includes("EDIT") ? "Edit file" : "Run command",
+          rawInput: text.includes("EDIT") ? { path: "probe.txt" } : { command: "echo approved" },
         },
         options: text.includes("NO_OPTIONS")
           ? []

@@ -19,6 +19,94 @@ import {
 } from "@t3tools/contracts";
 import { DevinDriver } from "./DevinDriver.ts";
 
+const decodeDevinSettings = Schema.decodeUnknownSync(DevinSettings);
+
+const withFakeDevin = Effect.fn("withFakeDevin")(function* (
+  body: (input: {
+    instance: Effect.Effect.Success<ReturnType<(typeof DevinDriver)["create"]>>;
+    cwd: string;
+    take: (...types: ProviderRuntimeEvent["type"][]) => Promise<ProviderRuntimeEvent>;
+  }) => Effect.Effect<unknown>,
+) {
+  const cwd = yield* Effect.promise(() =>
+    NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-devin-adapter-")),
+  );
+  const binaryPath = NodePath.join(cwd, "fake-devin");
+  const fake = NodeURL.fileURLToPath(
+    new URL("../devin/testFixtures/fakeDevin.mjs", import.meta.url),
+  );
+  yield* Effect.promise(() =>
+    NodeFSP.writeFile(binaryPath, `#!/bin/sh\nexec '${process.execPath}' '${fake}' "$@"\n`, {
+      mode: 0o700,
+    }),
+  );
+  const binaryBytes = yield* Effect.promise(() => NodeFSP.readFile(binaryPath));
+  yield* Effect.promise(() =>
+    NodeFSP.writeFile(
+      binaryPath + ".manifest.json",
+      JSON.stringify({
+        control_abi: 1,
+        owner_check: "pid",
+        clear: false,
+        capabilities: ["private-control-directory", "owner-pid", "compact"],
+        output_sha256: NodeCrypto.createHash("sha256").update(binaryBytes).digest("hex"),
+      }),
+    ),
+  );
+  const allowedPath = NodePath.join(cwd, "allowed.json");
+  yield* Effect.promise(() => NodeFSP.writeFile(allowedPath, '["fake"]'));
+  const catalogPath = NodePath.join(cwd, "models.json");
+  yield* Effect.promise(() =>
+    NodeFSP.writeFile(
+      catalogPath,
+      '{"families":[{"family_uid":"fake","variants":[{"model_uid":"fake"}]}]}',
+    ),
+  );
+  const events: ProviderRuntimeEvent[] = [];
+  let wake: (() => void) | undefined;
+  const take = async (...types: ProviderRuntimeEvent["type"][]) => {
+    while (true) {
+      const index = events.findIndex((event) => types.includes(event.type));
+      if (index >= 0) return events.splice(index, 1)[0]!;
+      await new Promise<void>((resolve) => {
+        wake = resolve;
+      });
+    }
+  };
+  yield* Effect.scoped(
+    Effect.gen(function* () {
+      const instance = yield* DevinDriver.create({
+        instanceId: ProviderInstanceId.make("devin-test"),
+        displayName: "Devin test",
+        environment: [
+          { name: "HOME", value: cwd, sensitive: false },
+          { name: "DEVIN_TEST_ALLOWED_FILE", value: allowedPath, sensitive: false },
+          { name: "DEVIN_TEST_CATALOG_FILE", value: catalogPath, sensitive: false },
+        ],
+        enabled: true,
+        config: decodeDevinSettings({
+          binaryPath,
+          model: "fake",
+          allowNativePrompt: false,
+          compactionThresholdTokens: "240000",
+        }),
+      }).pipe(
+        Effect.provide(ServerConfig.layerTest(cwd, NodePath.join(cwd, "t3-home"))),
+        Effect.provide(NodeServices.layer),
+        Effect.provideService(HostProcessPlatform, "darwin"),
+        Effect.provideService(HostProcessArchitecture, "arm64"),
+      );
+      yield* Stream.runForEach(instance.adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          events.push(event);
+          wake?.();
+        }),
+      ).pipe(Effect.forkScoped);
+      yield* body({ instance, cwd, take });
+    }),
+  );
+});
+
 it.effect(
   "T3 routes attachments, approvals, and soft cancellation through one native prompt",
   () =>
@@ -82,7 +170,7 @@ it.effect(
               { name: "DEVIN_TEST_CATALOG_FILE", value: catalogPath, sensitive: false },
             ],
             enabled: true,
-            config: Schema.decodeUnknownSync(DevinSettings)({
+            config: decodeDevinSettings({
               binaryPath,
               model: "fake",
               // Older saved settings must no longer block the first message.
@@ -122,7 +210,12 @@ it.effect(
               options: [{ id: "reasoningEffort", value: "high" }],
             },
           });
-          expect(selected.model).toBe("gpt-6-astra-high");
+          // The persisted session keeps the picker family slug so the
+          // orchestration model lock (picker vs picker) does not mistake an
+          // unchanged `gpt-6-astra` + high selection for a switch to the native
+          // `gpt-6-astra-high` variant after a soft stop. The native variant
+          // stays internal for the live run.
+          expect(selected.model).toBe("gpt-6-astra");
           // ProviderService supplies attachment paths before dispatching to the driver.
           const attachmentPath = NodePath.join(cwd, "example.txt");
           yield* Effect.promise(() => NodeFSP.writeFile(attachmentPath, "attached first task"));
@@ -288,5 +381,30 @@ it.effect(
         }),
       );
     }),
+  10000,
+);
+
+it.effect(
+  "full-access auto-approves native permissions without request events",
+  () =>
+    withFakeDevin(({ instance, cwd, take }) =>
+      Effect.gen(function* () {
+        const threadId = ThreadId.make("devin-full-access");
+        yield* instance.adapter.startSession({
+          threadId,
+          cwd,
+          runtimeMode: "full-access",
+        });
+        const turn = yield* instance.adapter.sendTurn({ threadId, input: "ASK_PERMISSION" });
+        const event = yield* Effect.promise(() => take("content.delta", "request.opened"));
+        expect(event.type).toBe("content.delta");
+        expect(event.turnId).toBe(turn.turnId);
+        expect(event.type === "content.delta" && event.payload.delta).toBe(
+          'PERMISSION_RESULT:{"outcome":{"outcome":"selected","optionId":"always-id"}}',
+        );
+        const completed = yield* Effect.promise(() => take("turn.completed"));
+        expect(completed.turnId).toBe(turn.turnId);
+      }),
+    ),
   10000,
 );
